@@ -203,5 +203,60 @@ class ReleaseTests(CliCase):
         self.assertEqual(self.run_json("leases")["leases"], [])
 
 
+class LifecycleTests(CliCase):
+    def setUp(self):
+        super().setUp()
+        self.run_json("configure")
+
+    def test_boot_and_shutdown_by_alias_udid_and_all(self):
+        booted = self.run_json("boot", "phone")
+        self.assertEqual([d["state"] for d in booted["devices"]], ["Booted"])
+        udid = booted["devices"][0]["udid"]
+        self.assertEqual(self.run_json("shutdown", udid)["devices"][0]["state"], "Shutdown")
+        self.assertEqual(len(self.run_json("boot", "all")["devices"]), 3)
+        self.assertEqual(len(self.run_json("shutdown", "all")["devices"]), 3)
+
+    def test_boot_refuses_device_outside_set(self):
+        foreign = make_device("iPhone 17 Pro", udid="FOREIGN")
+        self.fake.devices.append(foreign)
+        out = self.run_cli("boot", "FOREIGN", expect=1)
+        self.assertIn("outside set", out)
+        self.assertNotIn(("boot", "FOREIGN"), self.fake.calls)
+
+    def test_erase_calls_simctl_erase(self):
+        result = self.run_json("erase", "tablet")
+        self.assertIn(("erase", result["devices"][0]["udid"]), self.fake.calls)
+
+    def test_add_extends_roster_and_provisions(self):
+        result = self.run_json("add", "iPhone 17 Pro Max", "--alias", "phone-max")
+        self.assertEqual(result["created"][0]["name"], "[triton] iPhone 17 Pro Max")
+        manifest = json.loads((self.project / ".simset.json").read_text())
+        self.assertEqual(manifest["roster"][-1], {"type": "iPhone 17 Pro Max", "alias": "phone-max"})
+        self.assertEqual(self.run_json("claim", "phone-max")["type"], "iPhone 17 Pro Max")
+
+    def test_remove_needs_yes_then_deletes_and_drops_roster(self):
+        out = self.run_cli("remove", "phone-small", expect=1)
+        self.assertIn("--yes", out)
+        self.assertIn("[triton] iPhone 16e", self.fake.names())
+        self.run_json("boot", "phone-small")
+        result = self.run_json("remove", "phone-small", "--yes")
+        self.assertEqual(result["deleted"][0]["name"], "[triton] iPhone 16e")
+        self.assertNotIn("[triton] iPhone 16e", self.fake.names())
+        manifest = json.loads((self.project / ".simset.json").read_text())
+        self.assertEqual([e["type"] for e in manifest["roster"]], ["iPhone 17 Pro", "iPad Pro 13-inch (M5)"])
+
+    def test_destroy_removes_everything(self):
+        self.run_json("claim", "phone", "--boot")
+        out = self.run_cli("destroy", expect=1)
+        self.assertIn("--yes", out)
+        result = self.run_json("destroy", "--yes")
+        self.assertEqual(len(result["deleted"]), 3)
+        self.assertEqual(self.fake.names(), [])
+        self.assertFalse((self.project / ".simset.json").exists())
+        self.assertNotIn("simset", (self.project / "CLAUDE.md").read_text())
+        self.assertEqual(json.loads((self.home / "registry.json").read_text())["sets"], {})
+        self.assertEqual(self.run_json("leases")["leases"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

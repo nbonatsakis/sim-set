@@ -7,7 +7,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .claudemd import update_claude_md
+from .claudemd import remove_from_claude_md, update_claude_md
 from .leases import LeaseError, Leases, find_owner_pid
 from .naming import parse_name
 from .planning import (PlanningError, grow_op, matching_devices, plan_provision, resolve_devicetype,
@@ -262,6 +262,130 @@ def cmd_leases(ctx, args):
     return EXIT_OK
 
 
+def resolve_targets(ctx, manifest, devices, target, allow_all):
+    members = set_devices(devices, manifest.id)
+    if target == "all":
+        if not allow_all:
+            raise UsageError("'all' is not allowed for this command")
+        return members
+    by_udid = find_device(devices, target)
+    if by_udid is not None:
+        if by_udid not in members:
+            raise UsageError(f"{target} ({by_udid['name']}) is outside set [{manifest.id}]")
+        return [by_udid]
+    matches = matching_devices(devices, manifest.id, resolve_type(manifest, target))
+    if not matches:
+        raise UsageError(f"no device matching {target!r} in set [{manifest.id}]; see `simset list`")
+    return matches
+
+
+def require_yes(ctx, args, payload, lines):
+    if args.yes:
+        return None
+    emit(ctx, {**payload, "dry_run": True}, lines + ["re-run with --yes to apply"])
+    return EXIT_USER
+
+
+def rows_for(ctx, udids):
+    type_names = type_names_by_id(ctx.simctl.list_devicetypes())
+    devices = ctx.simctl.list_devices()
+    leases_by_udid = {lease.udid: lease for lease in ctx.leases.all()}
+    return [device_row(d, leases_by_udid.get(d["udid"]), type_names, ctx.leases)
+            for d in devices if d["udid"] in udids]
+
+
+def lifecycle(ctx, args, action, allow_all):
+    _, manifest = load_project(ctx)
+    targets = resolve_targets(ctx, manifest, ctx.simctl.list_devices(), args.target, allow_all)
+    for device in targets:
+        if action == "boot" and device.get("state") != "Booted":
+            ctx.simctl.boot(device["udid"])
+        elif action == "shutdown" and device.get("state") != "Shutdown":
+            ctx.simctl.shutdown(device["udid"])
+        elif action == "erase":
+            if device.get("state") == "Booted":
+                ctx.simctl.shutdown(device["udid"])
+            ctx.simctl.erase(device["udid"])
+    rows = rows_for(ctx, {d["udid"] for d in targets})
+    emit(ctx, {"action": action, "devices": rows}, [f"{action}: " + format_row(r) for r in rows])
+    return EXIT_OK
+
+
+def cmd_boot(ctx, args):
+    return lifecycle(ctx, args, "boot", allow_all=True)
+
+
+def cmd_shutdown(ctx, args):
+    return lifecycle(ctx, args, "shutdown", allow_all=True)
+
+
+def cmd_erase(ctx, args):
+    return lifecycle(ctx, args, "erase", allow_all=False)
+
+
+def cmd_add(ctx, args):
+    root, manifest = load_project(ctx)
+    devicetypes = ctx.simctl.list_devicetypes()
+    resolve_devicetype(devicetypes, args.type)
+    if args.type not in manifest.roster_types():
+        manifest.roster.append(RosterEntry(args.type, args.alias))
+    elif args.alias:
+        for entry in manifest.roster:
+            if entry.type == args.type:
+                entry.alias = args.alias
+    write_manifest(root, manifest)
+    runtime = resolve_runtime(ctx.simctl.list_runtimes(), manifest.runtime)
+    ops = plan_provision(manifest, ctx.simctl.list_devices(), devicetypes, runtime)
+    created = [{"name": op.name, "udid": ctx.simctl.create(op.name, op.devicetype_id, op.runtime_id)} for op in ops]
+    emit(ctx, {"created": created, "roster": manifest.to_dict()["roster"]},
+         [f"created {c['name']} ({c['udid']})" for c in created] or ["device already present"])
+    return EXIT_OK
+
+
+def delete_devices(ctx, devices):
+    deleted = []
+    for device in devices:
+        if device.get("state") == "Booted":
+            ctx.simctl.shutdown(device["udid"])
+        ctx.simctl.delete(device["udid"])
+        ctx.leases.release(device["udid"])
+        deleted.append({"name": device["name"], "udid": device["udid"]})
+    return deleted
+
+
+def cmd_remove(ctx, args):
+    root, manifest = load_project(ctx)
+    targets = resolve_targets(ctx, manifest, ctx.simctl.list_devices(), args.target, allow_all=False)
+    plan = [{"name": d["name"], "udid": d["udid"]} for d in targets]
+    blocked = require_yes(ctx, args, {"delete": plan}, [f"would delete {p['name']} ({p['udid']})" for p in plan])
+    if blocked:
+        return blocked
+    deleted = delete_devices(ctx, targets)
+    remaining_types = {parse_name(d["name"]).type_name for d in set_devices(ctx.simctl.list_devices(), manifest.id)}
+    manifest.roster = [e for e in manifest.roster if e.type in remaining_types]
+    write_manifest(root, manifest)
+    emit(ctx, {"deleted": deleted, "roster": manifest.to_dict()["roster"]}, [f"deleted {d['name']}" for d in deleted])
+    return EXIT_OK
+
+
+def cmd_destroy(ctx, args):
+    root, manifest = load_project(ctx)
+    targets = set_devices(ctx.simctl.list_devices(), manifest.id)
+    plan = [{"name": d["name"], "udid": d["udid"]} for d in targets]
+    blocked = require_yes(ctx, args, {"delete": plan, "manifest": str(manifest_path(root))},
+                          [f"would delete {p['name']} ({p['udid']})" for p in plan]
+                          + [f"would remove {manifest_path(root)} and the CLAUDE.md section, and unregister [{manifest.id}]"])
+    if blocked:
+        return blocked
+    deleted = delete_devices(ctx, targets)
+    ctx.leases.release_set(manifest.id)
+    ctx.registry.unregister(manifest.id)
+    remove_from_claude_md(root)
+    manifest_path(root).unlink(missing_ok=True)
+    emit(ctx, {"deleted": deleted, "id": manifest.id}, [f"deleted {d['name']}" for d in deleted] + [f"set [{manifest.id}] destroyed"])
+    return EXIT_OK
+
+
 def add_subcommand(sub, name, help_text, global_options):
     """Register a subcommand that also accepts --project/--json after the subcommand name."""
     return sub.add_parser(name, help=help_text, parents=[global_options])
@@ -309,6 +433,27 @@ def build_parser():
     p = add_subcommand(sub, "leases", "show leases across all sets", global_options)
     p.add_argument("--reap", action="store_true", help="delete stale leases")
     p.set_defaults(func=cmd_leases)
+
+    for name, func, help_text in [("boot", cmd_boot, "boot devices in this set"),
+                                  ("shutdown", cmd_shutdown, "shut down devices in this set"),
+                                  ("erase", cmd_erase, "erase a device in this set (shuts it down first)")]:
+        p = add_subcommand(sub, name, help_text, global_options)
+        p.add_argument("target", help="udid | alias | device type | all (boot/shutdown only)")
+        p.set_defaults(func=func)
+
+    p = add_subcommand(sub, "add", "add a device type to this set", global_options)
+    p.add_argument("type", help="exact device type name, e.g. \"iPhone 17 Pro Max\"")
+    p.add_argument("--alias", help="short alias for claim")
+    p.set_defaults(func=cmd_add)
+
+    p = add_subcommand(sub, "remove", "delete devices from this set", global_options)
+    p.add_argument("target", help="udid | alias | device type")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(func=cmd_remove)
+
+    p = add_subcommand(sub, "destroy", "delete the whole set, its manifest, and its CLAUDE.md section", global_options)
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(func=cmd_destroy)
     return parser
 
 
