@@ -49,6 +49,10 @@ class Simctl:
     def boot(self, udid):
         self._call("boot", udid)
 
+    def bootstatus(self, udid):
+        """Block until the device has finished booting (SpringBoard is up)."""
+        self._call("bootstatus", udid, "-b")
+
     def shutdown(self, udid):
         self._call("shutdown", udid)
 

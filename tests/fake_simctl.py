@@ -79,6 +79,10 @@ class FakeSimctl:
         self._find(udid)["state"] = "Booted"
         self.calls.append(("boot", udid))
 
+    def bootstatus(self, udid):
+        self._find(udid)
+        self.calls.append(("bootstatus", udid))
+
     def shutdown(self, udid):
         self._find(udid)["state"] = "Shutdown"
         self.calls.append(("shutdown", udid))

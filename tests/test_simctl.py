@@ -41,6 +41,11 @@ class SimctlTests(unittest.TestCase):
             "create [x] iPhone 17 Pro dt rt": ("ABC-123\n", 0, "")})
         self.assertEqual(Simctl(run).create("[x] iPhone 17 Pro", "dt", "rt"), "ABC-123")
 
+    def test_bootstatus_blocks_via_dash_b(self):
+        run = fake_run_factory({"bootstatus UDID -b": ("", 0, "")})
+        Simctl(run).bootstatus("UDID")
+        self.assertEqual(run.calls, [["bootstatus", "UDID", "-b"]])
+
     def test_nonzero_exit_raises_simctl_error_with_stderr(self):
         run = fake_run_factory({"boot BAD": ("", 149, "Invalid device: BAD")})
         with self.assertRaises(SimctlError) as ctx:

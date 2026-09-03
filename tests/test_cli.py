@@ -27,14 +27,20 @@ class CliCase(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
+    def _invoke(self, args, cwd):
+        out, err = io.StringIO(), io.StringIO()
+        code = cli.main(list(args), simctl=self.fake, env=self.env, stdout=out, stderr=err, cwd=str(cwd or self.project))
+        return code, out.getvalue(), err.getvalue()
+
     def run_cli(self, *args, cwd=None, expect=0):
-        out = io.StringIO()
-        code = cli.main(list(args), simctl=self.fake, env=self.env, stdout=out, cwd=str(cwd or self.project))
-        self.assertEqual(code, expect, out.getvalue())
-        return out.getvalue()
+        code, out, err = self._invoke(args, cwd)
+        self.assertEqual(code, expect, out + err)
+        return out + err
 
     def run_json(self, *args, cwd=None, expect=0):
-        return json.loads(self.run_cli(*args, "--json", cwd=cwd, expect=expect))
+        code, out, err = self._invoke(list(args) + ["--json"], cwd)
+        self.assertEqual(code, expect, out + err)
+        return json.loads(out)
 
 
 class ConfigureTests(CliCase):
@@ -70,6 +76,12 @@ class ConfigureTests(CliCase):
         self.assertIn("unknown device type", out)
         self.assertFalse((self.project / ".simset.json").exists())
 
+    def test_configure_with_mismatched_markers_is_user_error(self):
+        from simsetlib.claudemd import START
+        (self.project / "CLAUDE.md").write_text(f"# P\n\n{START}\nold\n")
+        out = self.run_cli("configure", expect=1)
+        self.assertIn("marker", out)
+
 
 class ListTests(CliCase):
     def test_list_shows_project_devices_with_state(self):
@@ -94,6 +106,13 @@ class ListTests(CliCase):
     def test_list_without_manifest_is_user_error(self):
         out = self.run_cli("list", expect=1)
         self.assertIn("simset configure", out)
+
+    def test_list_json_in_unconfigured_dir_emits_json_error(self):
+        empty = Path(self.tmp.name) / "empty-project"
+        empty.mkdir()
+        result = self.run_json("list", cwd=empty, expect=1)
+        self.assertEqual(result["exit_code"], 1)
+        self.assertIn("simset configure", result["error"])
 
     def test_project_root_is_found_from_subdirectory(self):
         self.run_json("configure")
@@ -121,6 +140,7 @@ class ClaimTests(CliCase):
     def setUp(self):
         super().setUp()
         self.run_json("configure")
+        self.fake.calls = []
 
     def test_claim_phone_returns_udid_and_leases_it(self):
         result = self.run_json("claim", "phone", "--label", "onboarding")
@@ -135,6 +155,7 @@ class ClaimTests(CliCase):
         result = self.run_json("claim", "tablet", "--boot")
         self.assertEqual(result["state"], "Booted")
         self.assertIn(("boot", result["udid"]), self.fake.calls)
+        self.assertIn(("bootstatus", result["udid"]), self.fake.calls)
 
     def test_second_claim_of_same_size_is_contention(self):
         self.env["SIMSET_OWNER_PID"] = "1"
@@ -142,11 +163,24 @@ class ClaimTests(CliCase):
         out = self.run_cli("claim", "phone", expect=3)
         self.assertIn("--grow", out)
 
+    def test_claim_json_contention_emits_json_error(self):
+        self.env["SIMSET_OWNER_PID"] = "1"
+        self.run_json("claim", "phone")
+        result = self.run_json("claim", "phone", expect=3)
+        self.assertEqual(result["exit_code"], 3)
+        self.assertIn("leased", result["error"])
+
     def test_grow_provisions_numbered_extra(self):
         self.env["SIMSET_OWNER_PID"] = "1"
         self.run_json("claim", "phone")
         result = self.run_json("claim", "phone", "--grow")
         self.assertEqual(result["name"], "[triton] iPhone 17 Pro #2")
+
+    def test_grow_caps_at_five_attempts(self):
+        with mock.patch.object(cli.Leases, "claim", return_value=None):
+            out = self.run_cli("claim", "phone", "--grow", expect=1)
+        self.assertIn("gave up", out)
+        self.assertEqual(len([c for c in self.fake.calls if c[0] == "create"]), 5)
 
     def test_claim_exact_type_outside_roster_is_user_error(self):
         out = self.run_cli("claim", "iPhone 17 Pro Max", expect=1)
@@ -165,6 +199,39 @@ class ClaimTests(CliCase):
             result = self.run_json("claim", "phone", "--wait", "10")
         self.assertEqual(result["udid"], first["udid"])
         self.assertEqual(len(sleeps), 1)
+
+    def test_wait_before_grow_claims_original_device_without_growing(self):
+        self.env["SIMSET_OWNER_PID"] = "1"
+        first = self.run_json("claim", "phone")
+        sleeps = []
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            self.run_json("release", first["udid"])
+
+        with mock.patch.object(cli.time, "sleep", fake_sleep):
+            result = self.run_json("claim", "phone", "--wait", "10", "--grow")
+        self.assertEqual(result["udid"], first["udid"])
+        self.assertEqual(len(sleeps), 1)
+        self.assertEqual([c for c in self.fake.calls if c[0] == "create"], [])
+
+    def test_claim_releases_lease_when_device_vanishes(self):
+        with mock.patch.object(cli, "find_device", return_value=None):
+            out = self.run_cli("claim", "phone", expect=1)
+        self.assertIn("disappeared", out)
+        self.assertEqual(self.run_json("leases")["leases"], [])
+
+    def test_claim_shows_owner_source_env(self):
+        result = self.run_json("claim", "phone")
+        self.assertEqual(result["lease"]["owner_source"], "env")
+
+    def test_claim_warns_on_parent_pid_owner_source(self):
+        del self.env["SIMSET_OWNER_PID"]
+        with mock.patch.object(cli, "find_owner_pid", return_value=(12345, "parent-pid")):
+            out = self.run_cli("claim", "phone")
+            self.assertIn("SIMSET_OWNER_PID", out)
+            result = self.run_json("claim", "tablet")
+        self.assertIn("SIMSET_OWNER_PID", result["warning"])
 
     def test_renew_extends_existing_lease(self):
         first = self.run_json("claim", "phone", "--ttl", "1")
@@ -212,6 +279,7 @@ class LifecycleTests(CliCase):
         booted = self.run_json("boot", "phone")
         self.assertEqual([d["state"] for d in booted["devices"]], ["Booted"])
         udid = booted["devices"][0]["udid"]
+        self.assertIn(("bootstatus", udid), self.fake.calls)
         self.assertEqual(self.run_json("shutdown", udid)["devices"][0]["state"], "Shutdown")
         self.assertEqual(len(self.run_json("boot", "all")["devices"]), 3)
         self.assertEqual(len(self.run_json("shutdown", "all")["devices"]), 3)

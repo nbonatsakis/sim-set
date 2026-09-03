@@ -21,6 +21,7 @@ class Lease:
     name: str
     set_id: str
     owner_pid: int
+    owner_source: str
     label: str
     claimed_at: str
     expires_at: str
@@ -110,7 +111,7 @@ class Leases:
         with self.locked():
             return self._reap_unlocked()
 
-    def claim(self, candidates, set_id, owner_pid, label="", ttl_hours=4.0):
+    def claim(self, candidates, set_id, owner_pid, owner_source, label="", ttl_hours=4.0):
         with self.locked():
             self._reap_unlocked()
             held = {lease.udid for lease in self.all()}
@@ -118,8 +119,9 @@ class Leases:
                 if device["udid"] in held:
                     continue
                 moment = self.now()
-                lease = Lease(device["udid"], device["name"], set_id, owner_pid, label,
-                              iso(moment), iso(moment + timedelta(hours=ttl_hours)))
+                lease = Lease(udid=device["udid"], name=device["name"], set_id=set_id, owner_pid=owner_pid,
+                              owner_source=owner_source, label=label, claimed_at=iso(moment),
+                              expires_at=iso(moment + timedelta(hours=ttl_hours)))
                 self._write(lease)
                 return lease
         return None
@@ -172,11 +174,12 @@ def process_ancestors(pid=None):
 
 
 def find_owner_pid(env=None, ancestors=process_ancestors, getppid=os.getppid):
+    """Return (pid, source): source is "env", "claude-ancestor", or "parent-pid"."""
     env = os.environ if env is None else env
     override = env.get("SIMSET_OWNER_PID")
     if override and override.isdigit():
-        return int(override)
+        return int(override), "env"
     for pid, command in ancestors():
         if Path(command.lstrip("-")).name == "claude":
-            return pid
-    return getppid()
+            return pid, "claude-ancestor"
+    return getppid(), "parent-pid"

@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from . import baguette
-from .claudemd import remove_from_claude_md, update_claude_md
+from .claudemd import SectionError, remove_from_claude_md, update_claude_md
 from .leases import LeaseError, Leases, find_owner_pid
 from .naming import parse_name
 from .planning import (PlanningError, grow_op, matching_devices, plan_provision, plan_prune, resolve_devicetype,
@@ -31,6 +31,7 @@ class Context:
     home: Path
     env: dict
     stdout: object
+    stderr: object
     cwd: Path
     json: bool
     project_arg: str | None
@@ -44,6 +45,14 @@ def emit(ctx, payload, human_lines):
     else:
         for line in human_lines:
             ctx.stdout.write(line + "\n")
+
+
+def emit_error(ctx, message, exit_code):
+    """Write an error consistently: JSON on stdout when --json, else plain text on stderr."""
+    if ctx.json:
+        ctx.stdout.write(json.dumps({"error": message, "exit_code": exit_code}) + "\n")
+    else:
+        ctx.stderr.write(f"error: {message}\n")
 
 
 def resolve_project_root(ctx, require=True):
@@ -68,8 +77,8 @@ def load_project(ctx):
 def lease_summary(lease, leases):
     if lease is None:
         return None
-    return {"owner_pid": lease.owner_pid, "label": lease.label, "expires_at": lease.expires_at,
-            "stale": leases.is_stale(lease)}
+    return {"owner_pid": lease.owner_pid, "owner_source": lease.owner_source, "label": lease.label,
+            "expires_at": lease.expires_at, "stale": leases.is_stale(lease)}
 
 
 def device_row(device, lease, type_names, leases):
@@ -173,6 +182,7 @@ def cmd_list(ctx, args):
 
 
 def owner_pid(ctx):
+    """Return (pid, source) — source is "env", "claude-ancestor", or "parent-pid"."""
     return find_owner_pid(ctx.env)
 
 
@@ -187,6 +197,17 @@ def find_device(devices, udid):
         if device["udid"] == udid:
             return device
     return None
+
+
+MAX_GROWS_PER_CLAIM = 5
+
+
+def refetch_device(ctx, lease):
+    device = find_device(ctx.simctl.list_devices(), lease.udid)
+    if device is None:
+        ctx.leases.release(lease.udid)
+        raise UsageError(f"device {lease.udid} disappeared after being claimed; lease released")
+    return device
 
 
 def cmd_claim(ctx, args):
@@ -209,28 +230,43 @@ def cmd_claim(ctx, args):
         raise UsageError(f"{type_name!r} is not in set [{manifest.id}]; run `simset add \"{type_name}\"` first")
 
     deadline = time.monotonic() + (args.wait or 0)
+    grows = 0
+    pid, source = owner_pid(ctx)
     while True:
         devices = ctx.simctl.list_devices()
         candidates = matching_devices(devices, manifest.id, type_name)
-        lease = ctx.leases.claim(candidates, manifest.id, owner_pid(ctx), args.label or "", args.ttl)
+        lease = ctx.leases.claim(candidates, manifest.id, pid, source, args.label or "", args.ttl)
         if lease:
             break
+        if args.wait and time.monotonic() < deadline:
+            time.sleep(2)
+            continue
         if args.grow:
+            if grows >= MAX_GROWS_PER_CLAIM:
+                raise UsageError(f"gave up after growing [{manifest.id}] {type_name} {MAX_GROWS_PER_CLAIM} times; still contended")
+            grows += 1
             runtime = resolve_runtime(ctx.simctl.list_runtimes(), manifest.runtime)
             op = grow_op(manifest, devices, ctx.simctl.list_devicetypes(), runtime, type_name)
             ctx.simctl.create(op.name, op.devicetype_id, op.runtime_id)
             continue
-        if args.wait and time.monotonic() < deadline:
-            time.sleep(2)
-            continue
-        ctx.stdout.write(f"error: every [{manifest.id}] {type_name} is leased; retry with --grow or --wait <seconds>\n")
+        emit_error(ctx, f"every [{manifest.id}] {type_name} is leased; retry with --grow or --wait <seconds>", EXIT_CONTENTION)
         return EXIT_CONTENTION
 
-    device = find_device(ctx.simctl.list_devices(), lease.udid)
+    warning = None
+    if source == "parent-pid":
+        warning = f"no claude ancestor found; lease bound to short-lived pid {pid}. Set SIMSET_OWNER_PID to a long-lived process id."
+
+    device = refetch_device(ctx, lease)
     if args.boot and device.get("state") != "Booted":
         ctx.simctl.boot(device["udid"])
-        device = find_device(ctx.simctl.list_devices(), lease.udid)
+        ctx.simctl.bootstatus(device["udid"])
+        device = refetch_device(ctx, lease)
     payload = claim_payload(ctx, device, lease, type_names)
+    if warning:
+        if ctx.json:
+            payload["warning"] = warning
+        else:
+            ctx.stderr.write(f"warning: {warning}\n")
     emit(ctx, payload, [f"claimed {device['name']}", f"udid {device['udid']}", f"state {device['state']}",
                         f"lease until {lease.expires_at} (pid {lease.owner_pid})"])
     return EXIT_OK
@@ -238,7 +274,8 @@ def cmd_claim(ctx, args):
 
 def cmd_release(ctx, args):
     if args.mine:
-        released = ctx.leases.release_owned(owner_pid(ctx))
+        pid, _source = owner_pid(ctx)
+        released = ctx.leases.release_owned(pid)
     elif args.all:
         _, manifest = load_project(ctx)
         released = ctx.leases.release_set(manifest.id)
@@ -302,6 +339,7 @@ def lifecycle(ctx, args, action, allow_all):
     for device in targets:
         if action == "boot" and device.get("state") != "Booted":
             ctx.simctl.boot(device["udid"])
+            ctx.simctl.bootstatus(device["udid"])
         elif action == "shutdown" and device.get("state") != "Shutdown":
             ctx.simctl.shutdown(device["udid"])
         elif action == "erase":
@@ -416,10 +454,10 @@ def cmd_ui(ctx, args):
     status = baguette.ensure_running(args.port, ctx.home)
     url = baguette.farm_url(args.port, None if args.all else manifest.id)
     if status == "missing":
-        ctx.stdout.write(f"booted [{manifest.id}] devices, but cannot open the UI.\n{baguette.INSTALL_HINT}\n")
+        emit_error(ctx, f"booted [{manifest.id}] devices, but cannot open the UI. {baguette.INSTALL_HINT}", EXIT_USER)
         return EXIT_USER
     if status == "timeout":
-        ctx.stdout.write(f"error: baguette did not answer on port {args.port} after 10s\n")
+        emit_error(ctx, f"baguette did not answer on port {args.port} after 10s", EXIT_USER)
         return EXIT_USER
     baguette.open_url(url)
     emit(ctx, {"url": url, "baguette": status}, [f"opened {url} (baguette {status})"])
@@ -553,19 +591,20 @@ def build_parser():
     return parser
 
 
-def main(argv=None, simctl=None, env=None, stdout=None, cwd=None):
+def main(argv=None, simctl=None, env=None, stdout=None, stderr=None, cwd=None):
     env = os.environ if env is None else env
     stdout = sys.stdout if stdout is None else stdout
+    stderr = sys.stderr if stderr is None else stderr
     args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     home = simset_home(env)
-    ctx = Context(simctl=simctl or Simctl(), home=home, env=env, stdout=stdout,
+    ctx = Context(simctl=simctl or Simctl(), home=home, env=env, stdout=stdout, stderr=stderr,
                   cwd=Path(cwd or os.getcwd()), json=args.json, project_arg=args.project,
                   registry=Registry(home), leases=Leases(home))
     try:
         return args.func(ctx, args)
     except SimctlError as error:
-        stdout.write(f"error: {error}\n")
+        emit_error(ctx, str(error), EXIT_SIMCTL)
         return EXIT_SIMCTL
-    except (UsageError, StateError, PlanningError, LeaseError) as error:
-        stdout.write(f"error: {error}\n")
+    except (UsageError, StateError, PlanningError, LeaseError, SectionError) as error:
+        emit_error(ctx, str(error), EXIT_USER)
         return EXIT_USER
