@@ -17,7 +17,6 @@ grep -q "simset:start" "$PROJECT/CLAUDE.md"
 echo "== claim + boot"
 CLAIM=$("$SIMSET" --project "$PROJECT" claim phone --label smoke --boot --json)
 UDID=$(echo "$CLAIM" | python3 -c 'import json,sys; print(json.load(sys.stdin)["udid"])')
-xcrun simctl bootstatus "$UDID" -b
 xcrun simctl list devices -j | python3 -c "import json,sys; devs=[d for v in json.load(sys.stdin)['devices'].values() for d in v]; d=[x for x in devs if x['udid']=='$UDID'][0]; assert d['name']=='[simset-smoke] iPhone 17 Pro', d; assert d['state']=='Booted', d"
 
 echo "== xcodebuild can see it"

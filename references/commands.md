@@ -20,14 +20,14 @@ Exit codes, used consistently across subcommands:
 - `3` — contention: `claim` found nothing free and was not told to `--grow` or
   `--wait` (`EXIT_CONTENTION`)
 
-Two commands print a plain-text error without going through `--json` at all,
-so scripts that always request `--json` still need to check the exit code:
-
-- `claim`, when nothing is free and neither `--grow` nor `--wait` resolves it:
-  `error: every [id] <type> is leased; retry with --grow or --wait <seconds>`
-  (exit `3`)
-- `ui`, when baguette is not installed or does not answer within 10s
-  (exit `1`)
+Every error path follows the same `--json` contract: without `--json`, a
+human-readable `error: <message>` line goes to **stderr** (not stdout), so
+piping stdout is always safe even on failure. With `--json`, the error is a
+JSON document on **stdout** instead: `{"error": "<message>", "exit_code": N}`,
+where `N` matches the process exit code. This applies uniformly — the
+exception handlers in `main` (missing manifest, unknown device type, lease
+errors, `SimctlError`, a malformed CLAUDE.md), `claim`'s contention message,
+and `ui`'s missing/timeout messages all go through the same helper.
 
 ## configure
 
@@ -90,7 +90,7 @@ Each device row (used here and in every other command's `devices`/`delete`/
       "state": "Booted",
       "runtime": "iOS-26-3",
       "available": true,
-      "lease": {"owner_pid": 4242, "label": "onboarding fix", "expires_at": "...", "stale": false}
+      "lease": {"owner_pid": 4242, "owner_source": "env", "label": "onboarding fix", "expires_at": "...", "stale": false}
     }
 
 `lease` is `null` when nothing has claimed the device. `type` is looked up
@@ -124,11 +124,21 @@ name a type that is actually in the roster (add it first with `simset add` if
 not).
 
 - `--label TEXT` — free-text note shown in `list`/`leases` output.
-- `--boot` — boot the claimed device if it isn't already `Booted`.
+- `--boot` — boot the claimed device if it isn't already `Booted`. `claim`
+  does not return until `xcrun simctl bootstatus <udid> -b` confirms the
+  device has finished booting (SpringBoard is up), so the returned udid is
+  immediately usable for screenshots, AXe, and app installs.
 - `--wait SECONDS` — if nothing is free, poll every 2 seconds until one frees
-  up or the timeout elapses, then exit `3`.
+  up or the timeout elapses.
 - `--grow` — if nothing is free, provision `[id] <type> #N` (next free index)
-  and claim that instead of waiting.
+  and claim that instead. Capped at 5 grows per invocation (`UsageError` past
+  that, in case something else keeps the device permanently contended).
+- `--wait` and `--grow` together: `claim` polls until the `--wait` deadline
+  first, and only falls through to `--grow` if the wait times out (or
+  immediately, if no `--wait` was given). Passing both is "wait, then grow if
+  still stuck" — it never grows before the wait is exhausted.
+- If every matching device is still leased after `--wait`/`--grow` don't
+  resolve it, `claim` exits `3` (see the error contract above).
 - `--ttl HOURS` — lease lifetime, default `4.0`. A lease is stale once its
   owner PID is dead or `expires_at` has passed; `leases --reap` and every
   `claim` call drop stale leases before allocating.
@@ -136,22 +146,24 @@ not).
   `expires_at` by `--ttl` hours. Errors (exit `1`) if the device no longer
   exists.
 
-Owner identity for a new lease: `SIMSET_OWNER_PID` if set in the environment,
-else the nearest ancestor process named `claude`, else the immediate parent
-PID (see `find_owner_pid` in `simsetlib/leases.py`).
+Owner identity for a new lease: `SIMSET_OWNER_PID` if set in the environment
+(`owner_source: "env"`), else the nearest ancestor process named `claude`
+(`"claude-ancestor"`), else the immediate parent PID (`"parent-pid"`) — see
+`find_owner_pid` in `simsetlib/leases.py`. The `"parent-pid"` fallback binds
+the lease to a process that, for a Claude Code Bash call, is dead before the
+lease is ever read again, so `claim` also prints a warning in that case
+(stderr, or a `"warning"` key in the JSON payload) pointing at
+`SIMSET_OWNER_PID`.
 
 JSON output (claim or renew) — a device row plus `set`:
 
     {
       "udid": "...", "name": "[triton] iPhone 17 Pro", "type": "iPhone 17 Pro",
       "state": "Booted", "runtime": "iOS-26-3", "available": true,
-      "lease": {"owner_pid": 4242, "label": "onboarding fix", "expires_at": "...", "stale": false},
+      "lease": {"owner_pid": 4242, "owner_source": "env", "label": "onboarding fix",
+                "expires_at": "...", "stale": false},
       "set": "triton"
     }
-
-If every matching device is leased and neither `--grow` nor `--wait` applies,
-`claim` writes a plain-text error to stdout (not JSON, see above) and exits
-`3`.
 
 ## release
 
@@ -179,7 +191,7 @@ Lease record fields (also the schema of `~/.simset/leases/<udid>.json`):
 
     {
       "udid": "...", "name": "[triton] iPhone 17 Pro", "set_id": "triton",
-      "owner_pid": 4242, "label": "onboarding fix",
+      "owner_pid": 4242, "owner_source": "env", "label": "onboarding fix",
       "claimed_at": "2026-09-03T16:00:00Z", "expires_at": "2026-09-03T20:00:00Z"
     }
 
@@ -200,9 +212,10 @@ JSON output:
 All three are scoped to the current project's set; a `udid` outside the set
 is rejected (exit `1`). `all` is accepted by `boot` and `shutdown` (every
 device in the set) but not by `erase`, which always targets a single
-resolved device or type match. `erase` shuts the device down first if it is
-booted, then always issues `simctl erase` (even if the device was already
-shut down).
+resolved device or type match. `boot` does not return until
+`xcrun simctl bootstatus <udid> -b` confirms the device has finished booting.
+`erase` shuts the device down first if it is booted, then always issues
+`simctl erase` (even if the device was already shut down).
 
 JSON output (same shape for all three):
 
@@ -230,11 +243,14 @@ device already exists.
 
     simset remove <udid|alias|"Device Type"> [--yes]
 
-Deletes the matching device(s) from the project's set and drops them from the
-roster (a roster entry is only removed once no device of that type remains).
-Without `--yes`, prints the delete plan and exits `1` (dry run); with
-`--yes`, shuts down any booted target, deletes it, releases its lease, and
-rewrites the manifest.
+Deletes the matching device(s) from the project's set and drops the roster
+entry for each removed type, but only if that type has no device of its own
+still in the set. A roster entry for a type this command didn't touch is
+never dropped, even if that type's device was deleted outside simset (Xcode,
+a manual `simctl delete`, a failed `configure`) — the manifest keeps it so
+the next `configure` reprovisions it. Without `--yes`, prints the delete
+plan and exits `1` (dry run); with `--yes`, shuts down any booted target,
+deletes it, releases its lease, and rewrites the manifest.
 
 Dry-run JSON output:
 
@@ -263,15 +279,18 @@ Applied JSON output:
 
 ## prune
 
-    simset prune [--keep "Device Type or full name"]... [--shutdown] [--yes]
+    simset prune (--keep "Device Type or full name"... | --keep-nothing) [--shutdown] [--yes]
 
 Deletes unmanaged (non-`[set] ...`-named) default-set devices that don't
 match the keep list. A device whose name parses as `[set] ...` is never
 touched, whether or not that set is registered — `prune` decides by name
 pattern alone. `--keep` matches by exact device name or by device type name;
-repeatable. Booted unmanaged devices are skipped unless `--shutdown`, which
-also shuts them down before deleting. Without `--yes`, prints the plan and
-exits `1`.
+repeatable. At least one `--keep` is required, or pass `--keep-nothing` to
+explicitly opt into deleting every unmanaged simulator on the machine;
+`prune --yes` with neither exits `1` before planning anything, so a missing
+or mistyped `--keep` can never wipe every hand-made simulator by accident.
+Booted unmanaged devices are skipped unless `--shutdown`, which also shuts
+them down before deleting. Without `--yes`, prints the plan and exits `1`.
 
 Dry-run JSON output:
 
@@ -386,8 +405,8 @@ prefix.
     {"sets": {"triton": {"project": "/Users/nick/dev/projects/triton", "created_at": "2026-09-03T16:00:00Z"}}}
 
 `~/.simset/leases/<udid>.json` — see the `leases` section above for the full
-field list (`udid`, `name`, `set_id`, `owner_pid`, `label`, `claimed_at`,
-`expires_at`).
+field list (`udid`, `name`, `set_id`, `owner_pid`, `owner_source`, `label`,
+`claimed_at`, `expires_at`).
 
 ## Environment
 

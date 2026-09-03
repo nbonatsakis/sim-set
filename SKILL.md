@@ -40,7 +40,7 @@ axe describe-ui --udid "$UDID"
 simset release --mine
 ```
 
-If every device of a size is leased: `simset claim phone --grow` provisions `[id] iPhone 17 Pro #2`; `--wait 300` blocks until one frees up (exit 3 on timeout). Leases expire after 4 hours (`--ttl`) or when the owning `claude` process exits; `--renew <udid>` extends one.
+`claim --boot` does not return until the device has finished booting (via `xcrun simctl bootstatus -b`), so it's safe to screenshot or drive the UI immediately after. If every device of a size is leased: `simset claim phone --wait 300` waits up to 5 minutes for one to free up; `--grow` provisions `[id] iPhone 17 Pro #2` instead. Passing both waits first and only grows if the wait times out. Leases expire after 4 hours (`--ttl`) or when the owning `claude` process exits; run `simset claim --renew <udid>` before that if you're still working. If `claim` warns about `SIMSET_OWNER_PID`, it means no `claude` ancestor process was found — set that environment variable to a long-lived pid.
 
 ## Manage simulators globally
 
@@ -48,11 +48,12 @@ If every device of a size is leased: `simset claim phone --grow` provisions `[id
 simset list --all                                   # every simulator grouped by set + unmanaged
 simset prune --keep "iPhone 17 Pro" --keep "iPad Pro 13-inch (M5)"   # dry run
 simset prune --keep "iPhone 17 Pro" --yes           # delete the rest of the unmanaged devices
+simset prune --keep-nothing --yes                   # delete every unmanaged simulator
 simset leases --reap                                # drop stale leases
 simset doctor                                       # Xcode, runtimes, baguette, registry, leases
 ```
 
-`prune` never touches a device whose name matches `[set] ...`, registered or not.
+`prune` never touches a device whose name matches `[set] ...`, registered or not. It also refuses to run at all unless you pass at least one `--keep`, or `--keep-nothing` to explicitly opt into deleting every unmanaged simulator.
 
 ## Live view
 

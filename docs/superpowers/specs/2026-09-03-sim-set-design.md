@@ -58,7 +58,7 @@ Everything must keep working with existing tools: `xcodebuild` (build and test),
 
 One file, organized as small pure functions over data plus a thin subprocess layer:
 
-- `Simctl` class: the only place that shells out. Methods `list_devices()`, `list_devicetypes()`, `list_runtimes()`, `create(name, devicetype, runtime)`, `delete(udid)`, `boot(udid)`, `shutdown(udid)`, `erase(udid)`. All return parsed JSON or raise `SimctlError` with stderr attached. Constructed with a `run` callable so tests inject a fake.
+- `Simctl` class: the only place that shells out. Methods `list_devices()`, `list_devicetypes()`, `list_runtimes()`, `create(name, devicetype, runtime)`, `delete(udid)`, `boot(udid)`, `bootstatus(udid)` (blocks until the device is fully booted, via `simctl bootstatus -b`), `shutdown(udid)`, `erase(udid)`. All return parsed JSON or raise `SimctlError` with stderr attached. Constructed with a `run` callable so tests inject a fake.
 - Naming: `device_name(set_id, devicetype_name, index)` and `parse_name(name) -> (set_id, devicetype_name, index) | None`. Pattern: `^\[(?P<set>[^\]]+)\] (?P<type>.+?)(?: #(?P<n>\d+))?$`.
 - Manifest: `load_manifest(project_root)`, `write_manifest(...)`. Schema below.
 - Registry: `load_registry()`, `register(set_id, project_root)`, `unregister(set_id)`.
@@ -95,7 +95,7 @@ One file, organized as small pure functions over data plus a thin subprocess lay
 `~/.simset/leases/<udid>.json`
 
 ```json
-{"udid": "...", "name": "[triton] iPhone 17 Pro", "set": "triton", "owner_pid": 4242, "label": "onboarding fix", "claimed_at": "...", "expires_at": "..."}
+{"udid": "...", "name": "[triton] iPhone 17 Pro", "set": "triton", "owner_pid": 4242, "owner_source": "env", "label": "onboarding fix", "claimed_at": "...", "expires_at": "..."}
 ```
 
 Default TTL is 4 hours, renewable via `simset claim --renew <udid>`. A lease is stale when its owner PID is not alive or `expires_at` has passed.
@@ -103,7 +103,7 @@ Default TTL is 4 hours, renewable via `simset claim --renew <udid>`. A lease is 
 `simset claim --json` output
 
 ```json
-{"udid": "...", "name": "[triton] iPhone 17 Pro", "type": "iPhone 17 Pro", "state": "Booted", "set": "triton", "lease": {"owner_pid": 4242, "expires_at": "..."}}
+{"udid": "...", "name": "[triton] iPhone 17 Pro", "type": "iPhone 17 Pro", "state": "Booted", "set": "triton", "lease": {"owner_pid": 4242, "owner_source": "env", "expires_at": "..."}}
 ```
 
 ## Commands
@@ -115,7 +115,7 @@ All commands accept `--project <path>` (default: walk up from cwd to the nearest
 - `list [--all]`
   Project's devices with state, type, and lease holder. `--all` lists every simulator grouped by set id, with an "unmanaged" group, and marks stale leases.
 - `claim <phone|phone-small|tablet|"Device Type"> [--label TEXT] [--boot] [--wait SECONDS] [--grow] [--ttl HOURS]`
-  Reaps stale leases, picks an unleased device matching the alias or type, writes a lease owned by the agent process, optionally boots it. Owner identity: `SIMSET_OWNER_PID` if set, else the nearest ancestor process whose executable is named `claude` (verified ancestry of a Claude Code Bash call: `zsh -> claude -> zsh -> login -> terminal`; the tool's own shell dies after each call so it must not be the owner), else the parent PID. `--grow` creates `[id] <type> #N` when none are free. `--wait` polls until one frees up or the timeout hits (exit 3). `--renew <udid>` extends an existing lease.
+  Reaps stale leases, picks an unleased device matching the alias or type, writes a lease owned by the agent process, optionally boots it. `--boot` does not return until the device is fully booted — `xcrun simctl boot` reports `Booted` well before SpringBoard is up, so `claim --boot` also runs `xcrun simctl bootstatus <udid> -b` before returning, and the same applies to the standalone `boot` command. Owner identity: `SIMSET_OWNER_PID` if set, else the nearest ancestor process whose executable is named `claude` (verified ancestry of a Claude Code Bash call: `zsh -> claude -> zsh -> login -> terminal`; the tool's own shell dies after each call so it must not be the owner), else the parent PID — the lease records which of these applied (`owner_source`), and `claim` warns when it had to fall back to the parent PID, since that process is typically already dead by the time the lease is read again. `--wait` polls every 2 seconds until one frees up or the timeout hits (exit 3 if it never does). `--grow` creates `[id] <type> #N` when none are free, capped at 5 creates per invocation. Given both, `claim` waits out the full `--wait` deadline first and only grows if that times out — it never grows immediately just because `--grow` was also passed. `--renew <udid>` extends an existing lease.
 - `release <udid> | --mine | --all`
   Removes leases. `--mine` releases every lease owned by the caller's PID tree; `--all` releases all leases in the project's set.
 - `leases [--reap]`
@@ -126,8 +126,8 @@ All commands accept `--project <path>` (default: walk up from cwd to the nearest
   Add or remove a roster entry and its device.
 - `destroy [--yes]`
   Shuts down and deletes every device in the set, drops leases, unregisters, removes the CLAUDE.md section, deletes `.simset.json`. Prints the plan and requires `--yes`.
-- `prune --keep "<Device Type or full name>" ... [--shutdown] [--yes]`
-  Deletes every unmanaged default-set device whose name is not in the keep list. Never touches a device whose name parses as `[set] ...` for any registered or unregistered set. Booted devices are skipped unless `--shutdown`. Prints the plan; requires `--yes`.
+- `prune (--keep "<Device Type or full name>" ... | --keep-nothing) [--shutdown] [--yes]`
+  Deletes every unmanaged default-set device whose name is not in the keep list. Never touches a device whose name parses as `[set] ...` for any registered or unregistered set. A keep list is mandatory: at least one `--keep` is required, or `--keep-nothing` must be passed explicitly to delete every unmanaged simulator. `prune --yes` with neither refuses before planning anything, so a missing or mistyped `--keep` can't wipe every hand-made simulator on the machine. Booted devices are skipped unless `--shutdown`. Prints the plan; requires `--yes`.
 - `ui [--all] [--port 8421]`
   Ensures a baguette server is running (starts `baguette serve --port` detached and records the pid), boots the project's devices, opens `http://127.0.0.1:<port>/farm?q=%5B<id>%5D` with `open`. `--all` opens the unfiltered farm.
 - `doctor`
@@ -141,13 +141,16 @@ Template in `references/claude-md-section.md`, rendered with the set id:
 <!-- simset:start -->
 ## iOS simulators (managed by sim-set)
 
-This project owns the simulator set `[triton]`. Rules for any agent:
+This project owns the simulator set `[triton]`. Rules for any agent working here:
 
-- Before using a simulator, claim one: `simset claim phone --label "<what you are doing>" --boot --json` (aliases: `phone`, `phone-small`, `tablet`, or an exact device type name). Use the returned `udid` everywhere: `xcodebuild -destination "platform=iOS Simulator,id=<udid>"`, AXe `--udid <udid>`, XcodeBuildMCP `simulatorId`, `xcrun simctl <cmd> <udid>`.
-- Never create, delete, erase, or boot simulators outside this set, and never pick a device by name like "iPhone 17 Pro"; always go through `simset`.
-- If every device of a size is taken, use `simset claim <size> --grow` or `--wait 300`.
+- Before using a simulator, claim one: `simset claim phone --label "<what you are doing>" --boot --json`. Aliases: `phone`, `phone-small`, `tablet`, or an exact device type name such as `"iPhone 17 Pro Max"`. With `--boot`, `claim` does not return until the device has finished booting (SpringBoard is up), so it's safe to run a screenshot or AXe command immediately after.
+- Use the returned `udid` everywhere: `xcodebuild -destination "platform=iOS Simulator,id=<udid>"`, AXe `--udid <udid>`, XcodeBuildMCP `simulatorId`, `xcrun simctl <cmd> <udid>`.
+- Never create, delete, erase, or boot simulators outside this set, and never pick a device by bare name like "iPhone 17 Pro". Always go through `simset`.
+- If every device of a size is taken: `simset claim <size> --wait 300` waits up to 5 minutes for one to free up; `simset claim <size> --grow` provisions another. Passing both waits first and only grows if the wait times out.
+- Leases expire after 4 hours by default (`--ttl HOURS` to change it). Working longer than that? Run `simset claim --renew <udid>` before it expires, or another agent may be handed the same device.
 - Release when done: `simset release --mine`.
-- `simset list` shows this project's devices and who holds them. `simset ui` opens a live view of them.
+- `simset list` shows this project's devices and who holds them. `simset ui` opens a live view of them in the browser.
+- If `claim` warns about `SIMSET_OWNER_PID`, it means no ancestor process named `claude` could be found, so the lease was bound to a short-lived pid and may be reaped early. Set the `SIMSET_OWNER_PID` environment variable to a long-lived process id to fix this.
 <!-- simset:end -->
 ```
 
@@ -167,10 +170,11 @@ The skill's SKILL.md documents: install via `~/dev/forks/baguette` and `swift bu
 
 ## Error handling
 
-- Any simctl failure raises `SimctlError` with the command and stderr; the CLI prints it and exits 2.
+- Every error path follows the same `--json` contract: without `--json`, a human-readable `error: <message>` line goes to stderr; with `--json`, `{"error": "<message>", "exit_code": N}` goes to stdout instead, where `N` is the process exit code. This covers `main`'s exception handlers (`SimctlError`, `UsageError`, `StateError`, `PlanningError`, `LeaseError`, a malformed CLAUDE.md), `claim`'s contention message, and `ui`'s missing/timeout messages — no error path writes to stdout in text mode or to stderr in `--json` mode.
+- Any simctl failure raises `SimctlError` with the command and stderr; the CLI reports it (per the contract above) and exits 2.
 - Lease files are written atomically (write temp, rename) under the flock. A crashed agent leaves a lease that the next `claim` reaps because its PID is dead.
 - `configure` never deletes devices. Only `remove`, `destroy`, and `prune` delete, and each prints its plan and requires `--yes`.
-- `prune` cannot delete a managed device even if the registry is missing, because it decides by name pattern, not registry.
+- `prune` cannot delete a managed device even if the registry is missing, because it decides by name pattern, not registry. It also refuses to run with an empty keep list unless `--keep-nothing` is passed, so a missing or mistyped `--keep` can't sweep every hand-made simulator on the machine.
 - `ui` degrades: if `baguette` is not on PATH, it prints the install instructions and exits 1 after still booting the devices.
 
 ## Testing
