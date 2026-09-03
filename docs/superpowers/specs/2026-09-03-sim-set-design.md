@@ -131,7 +131,7 @@ All commands accept `--project <path>` (default: walk up from cwd to the nearest
 - `ui [--all] [--port 8421]`
   Ensures a baguette server is running (starts `baguette serve --port` detached and records the pid), boots the project's devices, opens `http://127.0.0.1:<port>/farm?q=%5B<id>%5D` with `open`. `--all` opens the unfiltered farm.
 - `doctor`
-  Checks: Xcode and simctl reachable, at least one iOS runtime, `baguette` on PATH and reports whether it supports `?name=` (probes `baguette --version` for the fork marker), registry entries whose project path no longer exists, devices with `[set]` names that belong to no registered set, stale leases.
+  Checks: Xcode and simctl reachable, at least one iOS runtime, `baguette` on PATH and, if it's already running, whether it supports the `?q=` filter (probes the running server's `/farm/farm-filter.js` for `searchFromQuery`), registry entries whose project path no longer exists, devices with `[set]` names that belong to no registered set, stale leases.
 
 ## CLAUDE.md section
 

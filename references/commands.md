@@ -20,13 +20,14 @@ Exit codes, used consistently across subcommands:
 - `3` — contention: `claim` found nothing free and was not told to `--grow` or
   `--wait` (`EXIT_CONTENTION`)
 
-Two commands print a plain-text error and return exit `1` without going
-through `--json` at all, so scripts that always request `--json` still need to
-check the exit code:
+Two commands print a plain-text error without going through `--json` at all,
+so scripts that always request `--json` still need to check the exit code:
 
 - `claim`, when nothing is free and neither `--grow` nor `--wait` resolves it:
   `error: every [id] <type> is leased; retry with --grow or --wait <seconds>`
+  (exit `3`)
 - `ui`, when baguette is not installed or does not answer within 10s
+  (exit `1`)
 
 ## configure
 
@@ -156,9 +157,11 @@ If every matching device is leased and neither `--grow` nor `--wait` applies,
 
     simset release <udid> | --mine | --all
 
-Exactly one of a `udid`, `--mine`, or `--all` is required (else exit `1`).
-`--mine` releases every lease owned by the calling agent's PID; `--all`
-releases every lease in the current project's set, regardless of owner.
+At least one of a `udid`, `--mine`, or `--all` is required (else exit `1`).
+If more than one is given, `--mine` wins over `--all`, which wins over a
+`udid`. `--mine` releases every lease owned by the calling agent's PID;
+`--all` releases every lease in the current project's set, regardless of
+owner.
 
 JSON output:
 
@@ -300,7 +303,7 @@ are still booted either way.
 
 JSON output on success:
 
-    {"url": "http://127.0.0.1:8421/farm?q=%5B%5Btriton%5D%5D", "baguette": "running"}
+    {"url": "http://127.0.0.1:8421/farm?q=%5Btriton%5D", "baguette": "running"}
 
 `baguette` is `"running"` (already up) or `"started"` (simset started it).
 
@@ -347,7 +350,13 @@ via `Manifest.type_for_alias` (`scripts/simsetlib/state.py`):
   back to the first if there's only one
 - else `tablet` resolves to the roster's first `iPad*` type
 - anything else (including an alias with no match) is treated as a literal
-  device type name and validated against `xcrun simctl list devicetypes`
+  device type name. How that's checked depends on the command: `configure`
+  and `add` validate it against the real `xcrun simctl list devicetypes`
+  output (exit `1` if unknown); `claim` requires it to already be in the
+  project's roster (exit `1` if not, with a hint to `simset add` it first);
+  `boot`/`shutdown`/`erase` don't validate the name at all — they just report
+  `no device matching '<target>' in set [<id>]` (exit `1`) if nothing in the
+  set currently matches it
 
 `configure --roster` assigns default aliases while building a custom roster
 (`default_alias_for` in `scripts/simsetlib/cli.py`): the first `iPhone*`
