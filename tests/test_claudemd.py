@@ -5,8 +5,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import tempfile
 import unittest
 
-from simsetlib.claudemd import (END, START, inject_section, remove_from_claude_md, remove_section,
-                                render_section, update_claude_md)
+from simsetlib.claudemd import (END, START, SectionError, inject_section, remove_from_claude_md,
+                                remove_section, render_section, update_claude_md)
 
 
 class SectionTests(unittest.TestCase):
@@ -35,6 +35,20 @@ class SectionTests(unittest.TestCase):
         text = f"# P\n\n{START}\nx\n{END}\n\n## After\n"
         self.assertEqual(remove_section(text), "# P\n\n## After\n")
         self.assertEqual(remove_section("# P\n"), "# P\n")
+
+    def test_remove_section_preserves_blank_lines_in_unrelated_code_block(self):
+        text = ("# P\n\n"
+                "```text\nkeep\n\n\n\nthese\n```\n\n"
+                f"{START}\nbody\n{END}\n")
+        result = remove_section(text)
+        self.assertIn("keep\n\n\n\nthese", result)
+        self.assertNotIn(START, result)
+
+    def test_inject_raises_when_only_one_marker_present(self):
+        with self.assertRaises(SectionError):
+            inject_section(f"# P\n\n{START}\nold\n", f"{START}\nnew\n{END}")
+        with self.assertRaises(SectionError):
+            inject_section(f"# P\n\n{END}\nold\n", f"{START}\nnew\n{END}")
 
 
 class FileTests(unittest.TestCase):
