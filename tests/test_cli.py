@@ -313,6 +313,13 @@ class LifecycleTests(CliCase):
         manifest = json.loads((self.project / ".simset.json").read_text())
         self.assertEqual([e["type"] for e in manifest["roster"]], ["iPhone 17 Pro", "iPad Pro 13-inch (M5)"])
 
+    def test_remove_preserves_roster_entry_deleted_outside_simset(self):
+        tablet = next(d for d in self.fake.devices if d["name"] == "[triton] iPad Pro 13-inch (M5)")
+        self.fake.devices.remove(tablet)
+        self.run_json("remove", "phone-small", "--yes")
+        manifest = json.loads((self.project / ".simset.json").read_text())
+        self.assertIn("iPad Pro 13-inch (M5)", [e["type"] for e in manifest["roster"]])
+
     def test_destroy_removes_everything(self):
         self.run_json("claim", "phone", "--boot")
         out = self.run_cli("destroy", expect=1)
@@ -364,6 +371,20 @@ class PruneTests(CliCase):
         empty.mkdir()
         result = self.run_json("prune", "--keep", "iPhone 17 Pro", cwd=empty, expect=1)
         self.assertTrue(result["dry_run"])
+
+    def test_prune_without_keep_or_keep_nothing_is_user_error(self):
+        before = len(self.fake.devices)
+        out = self.run_cli("prune", "--yes", expect=1)
+        self.assertIn("--keep-nothing", out)
+        self.assertEqual(len(self.fake.devices), before)
+
+    def test_prune_keep_nothing_deletes_unmanaged_unbooted(self):
+        result = self.run_json("prune", "--keep-nothing", "--yes")
+        self.assertEqual(sorted(d["udid"] for d in result["deleted"]), ["GONE", "KEEP-TYPE"])
+        self.assertIn(("delete", "KEEP-TYPE"), self.fake.calls)
+        names = self.fake.names()
+        self.assertIn("[other] iPhone 16e", names)
+        self.assertIn("Booted Thing", names)
 
 
 from simsetlib import baguette

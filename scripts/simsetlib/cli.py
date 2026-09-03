@@ -401,8 +401,9 @@ def cmd_remove(ctx, args):
     if blocked:
         return blocked
     deleted = delete_devices(ctx, targets)
+    removed_types = {parse_name(d["name"]).type_name for d in targets}
     remaining_types = {parse_name(d["name"]).type_name for d in set_devices(ctx.simctl.list_devices(), manifest.id)}
-    manifest.roster = [e for e in manifest.roster if e.type in remaining_types]
+    manifest.roster = [e for e in manifest.roster if e.type not in removed_types or e.type in remaining_types]
     write_manifest(root, manifest)
     emit(ctx, {"deleted": deleted, "roster": manifest.to_dict()["roster"]}, [f"deleted {d['name']}" for d in deleted])
     return EXIT_OK
@@ -431,6 +432,8 @@ def brief(device):
 
 
 def cmd_prune(ctx, args):
+    if not args.keep and not args.keep_nothing:
+        raise UsageError("prune needs at least one --keep, or --keep-nothing to delete every unmanaged simulator")
     devicetypes = ctx.simctl.list_devicetypes()
     plan = plan_prune(ctx.simctl.list_devices(), args.keep or [], type_names_by_id(devicetypes), include_booted=args.shutdown)
     payload = {"delete": [brief(d) for d in plan.delete], "skipped_booted": [brief(d) for d in plan.skipped_booted],
@@ -577,6 +580,7 @@ def build_parser():
 
     p = add_subcommand(sub, "prune", "delete unmanaged simulators except a keep list; never touches [set] devices", global_options)
     p.add_argument("--keep", action="append", help="device name or device type to keep; repeatable")
+    p.add_argument("--keep-nothing", action="store_true", help="required in place of --keep to delete every unmanaged simulator")
     p.add_argument("--shutdown", action="store_true", help="also shut down and delete booted unmanaged devices")
     p.add_argument("--yes", action="store_true")
     p.set_defaults(func=cmd_prune)
