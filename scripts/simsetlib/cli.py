@@ -445,8 +445,9 @@ def cmd_doctor(ctx, args):
     if not binary:
         check("baguette", False, baguette.INSTALL_HINT.splitlines()[0])
     elif baguette.is_running(baguette.DEFAULT_PORT):
-        check("baguette", baguette.supports_query_filter(baguette.DEFAULT_PORT),
-              f"{binary} running; ?q= filter " + ("supported" if baguette.supports_query_filter(baguette.DEFAULT_PORT) else "NOT supported, build the fork"))
+        supported = baguette.supports_query_filter(baguette.DEFAULT_PORT)
+        check("baguette", supported,
+              f"{binary} running; ?q= filter " + ("supported" if supported else "NOT supported, build the fork"))
     else:
         check("baguette", True, f"{binary} (not running; `simset ui` starts it)")
 

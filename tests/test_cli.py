@@ -361,6 +361,23 @@ class DoctorTests(CliCase):
         self.assertIn("orphan", names["orphan-sets"]["detail"])
         self.assertTrue(names["leases"]["ok"])
 
+    def test_doctor_probes_query_filter_support_once(self):
+        self.run_json("configure")
+        calls = []
+
+        def counting_supports_query_filter(port):
+            calls.append(port)
+            return True
+
+        with mock.patch.object(cli.shutil, "which", lambda _: "/x/baguette"), \
+             mock.patch.object(cli.baguette, "is_running", lambda port: True), \
+             mock.patch.object(cli.baguette, "supports_query_filter", counting_supports_query_filter):
+            result = self.run_json("doctor")
+        names = {c["name"]: c for c in result["checks"]}
+        self.assertTrue(names["baguette"]["ok"])
+        self.assertIn("supported", names["baguette"]["detail"])
+        self.assertEqual(len(calls), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
