@@ -298,5 +298,69 @@ class PruneTests(CliCase):
         self.assertTrue(result["dry_run"])
 
 
+from simsetlib import baguette
+
+
+class BaguetteTests(unittest.TestCase):
+    def test_farm_url_encodes_set_prefix(self):
+        self.assertEqual(baguette.farm_url(8421, "triton"), "http://127.0.0.1:8421/farm?q=%5Btriton%5D")
+        self.assertEqual(baguette.farm_url(9000), "http://127.0.0.1:9000/farm")
+
+    def test_ensure_running_states(self):
+        home = Path(tempfile.mkdtemp())
+        self.assertEqual(baguette.ensure_running(8421, home, which=lambda _: None, running=lambda p: False), "missing")
+        self.assertEqual(baguette.ensure_running(8421, home, which=lambda _: "/x/baguette", running=lambda p: True), "running")
+        spawned = []
+        checks = iter([False, False, True])
+
+        class Proc:
+            pid = 777
+
+        result = baguette.ensure_running(8421, home, which=lambda _: "/x/baguette",
+                                         popen=lambda cmd, **kw: spawned.append(cmd) or Proc(),
+                                         running=lambda p: next(checks), sleep=lambda s: None)
+        self.assertEqual(result, "started")
+        self.assertEqual(spawned, [["/x/baguette", "serve", "--port", "8421"]])
+        self.assertEqual((home / "baguette.pid").read_text().strip(), "777")
+
+
+class UiTests(CliCase):
+    def setUp(self):
+        super().setUp()
+        self.run_json("configure")
+
+    def test_ui_boots_set_and_opens_filtered_farm(self):
+        opened = []
+        with mock.patch.object(cli.baguette, "ensure_running", lambda port, home: "running"), \
+             mock.patch.object(cli.baguette, "open_url", lambda url: opened.append(url)):
+            result = self.run_json("ui")
+        self.assertEqual(result["url"], "http://127.0.0.1:8421/farm?q=%5Btriton%5D")
+        self.assertEqual(opened, [result["url"]])
+        self.assertTrue(all(d["state"] == "Booted" for d in self.run_json("list")["devices"]))
+
+    def test_ui_all_opens_unfiltered_and_missing_baguette_fails_after_boot(self):
+        with mock.patch.object(cli.baguette, "ensure_running", lambda port, home: "missing"), \
+             mock.patch.object(cli.baguette, "open_url", lambda url: None):
+            out = self.run_cli("ui", "--all", expect=1)
+        self.assertIn("brew", out)
+        self.assertTrue(all(d["state"] == "Booted" for d in self.run_json("list")["devices"]))
+
+
+class DoctorTests(CliCase):
+    def test_doctor_reports_checks(self):
+        self.run_json("configure")
+        self.fake.devices.append(make_device("[orphan] iPhone 17 Pro"))
+        with mock.patch.object(cli.baguette, "is_running", lambda port: False), \
+             mock.patch.object(cli.shutil, "which", lambda _: None):
+            result = self.run_json("doctor", expect=1)
+        names = {c["name"]: c for c in result["checks"]}
+        self.assertTrue(names["simctl"]["ok"])
+        self.assertTrue(names["ios-runtime"]["ok"])
+        self.assertFalse(names["baguette"]["ok"])
+        self.assertFalse(names["orphan-sets"]["ok"])
+        self.assertIn("orphan", names["orphan-sets"]["detail"])
+        self.assertTrue(names["leases"]["ok"])
+
+
 if __name__ == "__main__":
     unittest.main()

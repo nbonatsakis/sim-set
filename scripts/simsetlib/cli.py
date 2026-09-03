@@ -2,11 +2,13 @@
 import argparse
 import json
 import os
+import shutil
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import baguette
 from .claudemd import remove_from_claude_md, update_claude_md
 from .leases import LeaseError, Leases, find_owner_pid
 from .naming import parse_name
@@ -406,6 +408,65 @@ def cmd_prune(ctx, args):
     return EXIT_OK
 
 
+def cmd_ui(ctx, args):
+    _, manifest = load_project(ctx)
+    for device in set_devices(ctx.simctl.list_devices(), manifest.id):
+        if device.get("state") != "Booted":
+            ctx.simctl.boot(device["udid"])
+    status = baguette.ensure_running(args.port, ctx.home)
+    url = baguette.farm_url(args.port, None if args.all else manifest.id)
+    if status == "missing":
+        ctx.stdout.write(f"booted [{manifest.id}] devices, but cannot open the UI.\n{baguette.INSTALL_HINT}\n")
+        return EXIT_USER
+    if status == "timeout":
+        ctx.stdout.write(f"error: baguette did not answer on port {args.port} after 10s\n")
+        return EXIT_USER
+    baguette.open_url(url)
+    emit(ctx, {"url": url, "baguette": status}, [f"opened {url} (baguette {status})"])
+    return EXIT_OK
+
+
+def cmd_doctor(ctx, args):
+    checks = []
+
+    def check(name, ok, detail):
+        checks.append({"name": name, "ok": bool(ok), "detail": detail})
+
+    try:
+        runtimes = ctx.simctl.list_runtimes()
+        check("simctl", True, "xcrun simctl reachable")
+    except SimctlError as error:
+        runtimes = []
+        check("simctl", False, str(error))
+    ios = [r for r in runtimes if r.get("platform") == "iOS" and r.get("isAvailable")]
+    check("ios-runtime", ios, ", ".join(sorted(r["version"] for r in ios)) or "no available iOS runtime; run `xcodebuild -downloadPlatform iOS`")
+
+    binary = shutil.which("baguette")
+    if not binary:
+        check("baguette", False, baguette.INSTALL_HINT.splitlines()[0])
+    elif baguette.is_running(baguette.DEFAULT_PORT):
+        check("baguette", baguette.supports_query_filter(baguette.DEFAULT_PORT),
+              f"{binary} running; ?q= filter " + ("supported" if baguette.supports_query_filter(baguette.DEFAULT_PORT) else "NOT supported, build the fork"))
+    else:
+        check("baguette", True, f"{binary} (not running; `simset ui` starts it)")
+
+    registered = ctx.registry.sets()
+    missing = [sid for sid, info in registered.items() if not Path(info["project"]).exists()]
+    check("registry", not missing, ", ".join(f"[{s}] project path missing" for s in missing) or f"{len(registered)} registered sets")
+
+    devices = ctx.simctl.list_devices() if checks[0]["ok"] else []
+    seen = {parse_name(d["name"]).set_id for d in devices if parse_name(d["name"])}
+    orphans = sorted(seen - set(registered))
+    check("orphan-sets", not orphans, ("orphan sets with devices but no registry entry: " + ", ".join(f"[{s}]" for s in orphans)) if orphans else "every managed set is registered")
+
+    stale = [l for l in ctx.leases.all() if ctx.leases.is_stale(l)]
+    check("leases", not stale, f"{len(stale)} stale leases; run `simset leases --reap`" if stale else f"{len(ctx.leases.all())} active leases")
+
+    ok = all(c["ok"] for c in checks)
+    emit(ctx, {"ok": ok, "checks": checks}, [("ok   " if c["ok"] else "FAIL ") + f"{c['name']}: {c['detail']}" for c in checks])
+    return EXIT_OK if ok else EXIT_USER
+
+
 def add_subcommand(sub, name, help_text, global_options):
     """Register a subcommand that also accepts --project/--json after the subcommand name."""
     return sub.add_parser(name, help=help_text, parents=[global_options])
@@ -480,6 +541,14 @@ def build_parser():
     p.add_argument("--shutdown", action="store_true", help="also shut down and delete booted unmanaged devices")
     p.add_argument("--yes", action="store_true")
     p.set_defaults(func=cmd_prune)
+
+    p = add_subcommand(sub, "ui", "boot this set and open the baguette farm filtered to it", global_options)
+    p.add_argument("--all", action="store_true", help="open the unfiltered farm")
+    p.add_argument("--port", type=int, default=baguette.DEFAULT_PORT)
+    p.set_defaults(func=cmd_ui)
+
+    p = add_subcommand(sub, "doctor", "check Xcode, runtimes, baguette, registry, and leases", global_options)
+    p.set_defaults(func=cmd_doctor)
     return parser
 
 
