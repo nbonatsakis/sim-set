@@ -6,7 +6,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import unittest
 
 from fake_simctl import (DEFAULT_DEVICETYPES, DEFAULT_RUNTIMES, IOS_18_4, IOS_26_3, IPAD_PRO_13,
-                         IPHONE_16E, IPHONE_17_PRO, make_device)
+                         IPHONE_16E, IPHONE_17_PRO, IPHONE_17_PRO_MAX, make_device)
 from simsetlib.planning import (PlanningError, grow_op, matching_devices, next_index, plan_provision,
                                 plan_prune, resolve_devicetype, resolve_runtime, resolve_type,
                                 set_devices, type_names_by_id)
@@ -77,7 +77,7 @@ class PruneTests(unittest.TestCase):
             make_device("[triton] iPhone 17 Pro"),
             make_device("iPhone 17 Pro"),
             make_device("iPhone 17 Pro Max", devicetype_id="com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro-Max"),
-            make_device("Old Booted", state="Booted"),
+            make_device("Old Booted", state="Booted", devicetype_id=IPHONE_17_PRO_MAX),
             make_device("My Custom Name", devicetype_id=IPHONE_16E),
         ]
         names = type_names_by_id(DEFAULT_DEVICETYPES)
@@ -91,6 +91,13 @@ class PruneTests(unittest.TestCase):
         devices = [make_device("Old Booted", state="Booted")]
         plan = plan_prune(devices, keep=[], type_names={}, include_booted=True)
         self.assertEqual([d["name"] for d in plan.delete], ["Old Booted"])
+        self.assertEqual(plan.skipped_booted, [])
+
+    def test_prune_keeps_booted_device_when_type_is_kept(self):
+        devices = [make_device("Booted iPhone 17 Pro", state="Booted", devicetype_id=IPHONE_17_PRO)]
+        names = type_names_by_id(DEFAULT_DEVICETYPES)
+        plan = plan_prune(devices, keep=["iPhone 17 Pro"], type_names=names, include_booted=False)
+        self.assertEqual([d["name"] for d in plan.kept], ["Booted iPhone 17 Pro"])
         self.assertEqual(plan.skipped_booted, [])
 
 

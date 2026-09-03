@@ -89,10 +89,10 @@ def plan_prune(devices, keep, type_names, include_booted=False):
     for device in devices:
         if parse_name(device["name"]):
             plan.managed.append(device)
-        elif device.get("state") == "Booted" and not include_booted:
-            plan.skipped_booted.append(device)
         elif device["name"] in keep or type_names.get(device.get("deviceTypeIdentifier"), "") in keep:
             plan.kept.append(device)
+        elif device.get("state") == "Booted" and not include_booted:
+            plan.skipped_booted.append(device)
         else:
             plan.delete.append(device)
     return plan
