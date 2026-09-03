@@ -8,6 +8,7 @@ import json
 import os
 import tempfile
 import unittest
+from unittest import mock
 
 from fake_simctl import FakeSimctl, IPHONE_16E, make_device
 from simsetlib import cli
@@ -114,6 +115,92 @@ class GlobalFlagTests(CliCase):
         self.run_json("configure")
         out = self.run_cli("--json", "list")
         self.assertEqual(json.loads(out)["id"], "triton")
+
+
+class ClaimTests(CliCase):
+    def setUp(self):
+        super().setUp()
+        self.run_json("configure")
+
+    def test_claim_phone_returns_udid_and_leases_it(self):
+        result = self.run_json("claim", "phone", "--label", "onboarding")
+        self.assertEqual(result["name"], "[triton] iPhone 17 Pro")
+        self.assertEqual(result["type"], "iPhone 17 Pro")
+        self.assertEqual(result["lease"]["owner_pid"], os.getpid())
+        self.assertEqual(result["lease"]["label"], "onboarding")
+        listing = self.run_json("list")
+        self.assertEqual(listing["devices"][0]["lease"]["label"], "onboarding")
+
+    def test_claim_boots_when_asked(self):
+        result = self.run_json("claim", "tablet", "--boot")
+        self.assertEqual(result["state"], "Booted")
+        self.assertIn(("boot", result["udid"]), self.fake.calls)
+
+    def test_second_claim_of_same_size_is_contention(self):
+        self.env["SIMSET_OWNER_PID"] = "1"
+        self.run_json("claim", "phone")
+        out = self.run_cli("claim", "phone", expect=3)
+        self.assertIn("--grow", out)
+
+    def test_grow_provisions_numbered_extra(self):
+        self.env["SIMSET_OWNER_PID"] = "1"
+        self.run_json("claim", "phone")
+        result = self.run_json("claim", "phone", "--grow")
+        self.assertEqual(result["name"], "[triton] iPhone 17 Pro #2")
+
+    def test_claim_exact_type_outside_roster_is_user_error(self):
+        out = self.run_cli("claim", "iPhone 17 Pro Max", expect=1)
+        self.assertIn("simset add", out)
+
+    def test_wait_polls_until_free(self):
+        self.env["SIMSET_OWNER_PID"] = "1"
+        first = self.run_json("claim", "phone")
+        sleeps = []
+
+        def fake_sleep(seconds):
+            sleeps.append(seconds)
+            self.run_json("release", first["udid"])
+
+        with mock.patch.object(cli.time, "sleep", fake_sleep):
+            result = self.run_json("claim", "phone", "--wait", "10")
+        self.assertEqual(result["udid"], first["udid"])
+        self.assertEqual(len(sleeps), 1)
+
+    def test_renew_extends_existing_lease(self):
+        first = self.run_json("claim", "phone", "--ttl", "1")
+        renewed = self.run_json("claim", "--renew", first["udid"], "--ttl", "8")
+        self.assertGreater(renewed["lease"]["expires_at"], first["lease"]["expires_at"])
+
+
+class ReleaseTests(CliCase):
+    def setUp(self):
+        super().setUp()
+        self.run_json("configure")
+
+    def test_release_by_udid_and_mine_and_all(self):
+        a = self.run_json("claim", "phone")
+        self.assertEqual(self.run_json("release", a["udid"])["released"], [a["udid"]])
+        self.run_json("claim", "phone")
+        self.run_json("claim", "tablet")
+        self.assertEqual(len(self.run_json("release", "--mine")["released"]), 2)
+        self.env["SIMSET_OWNER_PID"] = "1"
+        self.run_json("claim", "phone")
+        self.env["SIMSET_OWNER_PID"] = str(os.getpid())
+        self.assertEqual(len(self.run_json("release", "--all")["released"]), 1)
+
+    def test_release_requires_a_target(self):
+        out = self.run_cli("release", expect=1)
+        self.assertIn("--mine", out)
+
+    def test_leases_lists_and_reaps(self):
+        self.env["SIMSET_OWNER_PID"] = "999999"
+        self.run_json("claim", "phone")
+        listing = self.run_json("leases")
+        self.assertEqual(len(listing["leases"]), 1)
+        self.assertTrue(listing["leases"][0]["stale"])
+        reaped = self.run_json("leases", "--reap")
+        self.assertEqual(len(reaped["reaped"]), 1)
+        self.assertEqual(self.run_json("leases")["leases"], [])
 
 
 if __name__ == "__main__":

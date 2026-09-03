@@ -3,14 +3,15 @@ import argparse
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
 from .claudemd import update_claude_md
-from .leases import LeaseError, Leases
+from .leases import LeaseError, Leases, find_owner_pid
 from .naming import parse_name
-from .planning import (PlanningError, plan_provision, resolve_devicetype, resolve_runtime, set_devices,
-                       type_names_by_id)
+from .planning import (PlanningError, grow_op, matching_devices, plan_provision, resolve_devicetype,
+                       resolve_runtime, resolve_type, set_devices, type_names_by_id)
 from .simctl import Simctl, SimctlError
 from .state import (Manifest, Registry, RosterEntry, StateError, find_project_root, load_manifest,
                     manifest_path, simset_home, write_manifest)
@@ -169,6 +170,98 @@ def cmd_list(ctx, args):
     return EXIT_OK
 
 
+def owner_pid(ctx):
+    return find_owner_pid(ctx.env)
+
+
+def claim_payload(ctx, device, lease, type_names):
+    row = device_row(device, lease, type_names, ctx.leases)
+    row["set"] = lease.set_id
+    return row
+
+
+def find_device(devices, udid):
+    for device in devices:
+        if device["udid"] == udid:
+            return device
+    return None
+
+
+def cmd_claim(ctx, args):
+    root, manifest = load_project(ctx)
+    type_names = type_names_by_id(ctx.simctl.list_devicetypes())
+
+    if args.renew:
+        lease = ctx.leases.renew(args.renew, args.ttl)
+        device = find_device(ctx.simctl.list_devices(), args.renew)
+        if device is None:
+            raise UsageError(f"device {args.renew} no longer exists")
+        payload = claim_payload(ctx, device, lease, type_names)
+        emit(ctx, payload, [f"renewed {device['name']} until {lease.expires_at}"])
+        return EXIT_OK
+    if not args.target:
+        raise UsageError("claim needs a size or device type (phone, phone-small, tablet, or an exact type name) or --renew <udid>")
+
+    type_name = resolve_type(manifest, args.target)
+    if type_name not in manifest.roster_types():
+        raise UsageError(f"{type_name!r} is not in set [{manifest.id}]; run `simset add \"{type_name}\"` first")
+
+    deadline = time.monotonic() + (args.wait or 0)
+    while True:
+        devices = ctx.simctl.list_devices()
+        candidates = matching_devices(devices, manifest.id, type_name)
+        lease = ctx.leases.claim(candidates, manifest.id, owner_pid(ctx), args.label or "", args.ttl)
+        if lease:
+            break
+        if args.grow:
+            runtime = resolve_runtime(ctx.simctl.list_runtimes(), manifest.runtime)
+            op = grow_op(manifest, devices, ctx.simctl.list_devicetypes(), runtime, type_name)
+            ctx.simctl.create(op.name, op.devicetype_id, op.runtime_id)
+            continue
+        if args.wait and time.monotonic() < deadline:
+            time.sleep(2)
+            continue
+        ctx.stdout.write(f"error: every [{manifest.id}] {type_name} is leased; retry with --grow or --wait <seconds>\n")
+        return EXIT_CONTENTION
+
+    device = find_device(ctx.simctl.list_devices(), lease.udid)
+    if args.boot and device.get("state") != "Booted":
+        ctx.simctl.boot(device["udid"])
+        device = find_device(ctx.simctl.list_devices(), lease.udid)
+    payload = claim_payload(ctx, device, lease, type_names)
+    emit(ctx, payload, [f"claimed {device['name']}", f"udid {device['udid']}", f"state {device['state']}",
+                        f"lease until {lease.expires_at} (pid {lease.owner_pid})"])
+    return EXIT_OK
+
+
+def cmd_release(ctx, args):
+    if args.mine:
+        released = ctx.leases.release_owned(owner_pid(ctx))
+    elif args.all:
+        _, manifest = load_project(ctx)
+        released = ctx.leases.release_set(manifest.id)
+    elif args.udid:
+        lease = ctx.leases.get(args.udid)
+        released = [lease] if lease and ctx.leases.release(args.udid) else []
+    else:
+        raise UsageError("release needs a udid, --mine, or --all")
+    udids = [lease.udid for lease in released if lease]
+    emit(ctx, {"released": udids}, [f"released {u}" for u in udids] or ["nothing to release"])
+    return EXIT_OK
+
+
+def cmd_leases(ctx, args):
+    if args.reap:
+        reaped = ctx.leases.reap()
+        emit(ctx, {"reaped": [l.to_dict() for l in reaped]}, [f"reaped {l.udid} ({l.name})" for l in reaped] or ["no stale leases"])
+        return EXIT_OK
+    rows = [{**l.to_dict(), "stale": ctx.leases.is_stale(l)} for l in ctx.leases.all()]
+    lines = [f"{r['udid']}  {r['name']}  pid {r['owner_pid']}  until {r['expires_at']}" + ("  [stale]" if r["stale"] else "")
+             + (f"  ({r['label']})" if r["label"] else "") for r in rows] or ["no leases"]
+    emit(ctx, {"leases": rows}, lines)
+    return EXIT_OK
+
+
 def add_subcommand(sub, name, help_text, global_options):
     """Register a subcommand that also accepts --project/--json after the subcommand name."""
     return sub.add_parser(name, help=help_text, parents=[global_options])
@@ -196,6 +289,26 @@ def build_parser():
     p = add_subcommand(sub, "list", "list this project's devices (or every simulator with --all)", global_options)
     p.add_argument("--all", action="store_true")
     p.set_defaults(func=cmd_list)
+
+    p = add_subcommand(sub, "claim", "lease a device of a size/type from this project's set", global_options)
+    p.add_argument("target", nargs="?", help="phone | phone-small | tablet | exact device type name")
+    p.add_argument("--label", help="what you are doing (shown in list)")
+    p.add_argument("--boot", action="store_true", help="boot the device after claiming")
+    p.add_argument("--wait", type=int, default=0, help="seconds to wait for a free device")
+    p.add_argument("--grow", action="store_true", help="provision another device of this type if none is free")
+    p.add_argument("--ttl", type=float, default=4.0, help="lease hours (default 4)")
+    p.add_argument("--renew", metavar="UDID", help="extend an existing lease instead of claiming")
+    p.set_defaults(func=cmd_claim)
+
+    p = add_subcommand(sub, "release", "release leases", global_options)
+    p.add_argument("udid", nargs="?")
+    p.add_argument("--mine", action="store_true", help="release every lease owned by this agent")
+    p.add_argument("--all", action="store_true", help="release every lease in this project's set")
+    p.set_defaults(func=cmd_release)
+
+    p = add_subcommand(sub, "leases", "show leases across all sets", global_options)
+    p.add_argument("--reap", action="store_true", help="delete stale leases")
+    p.set_defaults(func=cmd_leases)
     return parser
 
 
