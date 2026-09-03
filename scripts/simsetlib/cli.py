@@ -10,7 +10,7 @@ from pathlib import Path
 from .claudemd import remove_from_claude_md, update_claude_md
 from .leases import LeaseError, Leases, find_owner_pid
 from .naming import parse_name
-from .planning import (PlanningError, grow_op, matching_devices, plan_provision, resolve_devicetype,
+from .planning import (PlanningError, grow_op, matching_devices, plan_provision, plan_prune, resolve_devicetype,
                        resolve_runtime, resolve_type, set_devices, type_names_by_id)
 from .simctl import Simctl, SimctlError
 from .state import (Manifest, Registry, RosterEntry, StateError, find_project_root, load_manifest,
@@ -386,6 +386,26 @@ def cmd_destroy(ctx, args):
     return EXIT_OK
 
 
+def brief(device):
+    return {"name": device["name"], "udid": device["udid"], "state": device.get("state")}
+
+
+def cmd_prune(ctx, args):
+    devicetypes = ctx.simctl.list_devicetypes()
+    plan = plan_prune(ctx.simctl.list_devices(), args.keep or [], type_names_by_id(devicetypes), include_booted=args.shutdown)
+    payload = {"delete": [brief(d) for d in plan.delete], "skipped_booted": [brief(d) for d in plan.skipped_booted],
+               "kept": [brief(d) for d in plan.kept], "managed": [brief(d) for d in plan.managed]}
+    lines = [f"would delete {d['name']} ({d['udid']})" for d in payload["delete"]] or ["nothing to delete"]
+    lines += [f"skipping booted {d['name']} (use --shutdown)" for d in payload["skipped_booted"]]
+    lines += [f"keeping {len(plan.kept)} kept and {len(plan.managed)} managed devices"]
+    blocked = require_yes(ctx, args, payload, lines)
+    if blocked:
+        return blocked
+    deleted = delete_devices(ctx, plan.delete)
+    emit(ctx, {**payload, "deleted": deleted}, [f"deleted {d['name']}" for d in deleted] or ["nothing deleted"])
+    return EXIT_OK
+
+
 def add_subcommand(sub, name, help_text, global_options):
     """Register a subcommand that also accepts --project/--json after the subcommand name."""
     return sub.add_parser(name, help=help_text, parents=[global_options])
@@ -454,6 +474,12 @@ def build_parser():
     p = add_subcommand(sub, "destroy", "delete the whole set, its manifest, and its CLAUDE.md section", global_options)
     p.add_argument("--yes", action="store_true")
     p.set_defaults(func=cmd_destroy)
+
+    p = add_subcommand(sub, "prune", "delete unmanaged simulators except a keep list; never touches [set] devices", global_options)
+    p.add_argument("--keep", action="append", help="device name or device type to keep; repeatable")
+    p.add_argument("--shutdown", action="store_true", help="also shut down and delete booted unmanaged devices")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(func=cmd_prune)
     return parser
 
 

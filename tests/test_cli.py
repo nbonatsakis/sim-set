@@ -258,5 +258,45 @@ class LifecycleTests(CliCase):
         self.assertEqual(self.run_json("leases")["leases"], [])
 
 
+class PruneTests(CliCase):
+    def setUp(self):
+        super().setUp()
+        self.fake.devices += [
+            make_device("iPhone 17 Pro", udid="KEEP-TYPE"),
+            make_device("iPhone 17 Pro Max", udid="GONE", devicetype_id="com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro-Max"),
+            make_device("Booted Thing", udid="BOOTED", state="Booted", devicetype_id="com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro-Max"),
+            make_device("[other] iPhone 16e", udid="MANAGED", devicetype_id=IPHONE_16E),
+        ]
+        self.run_json("configure")
+
+    def test_prune_is_dry_run_without_yes(self):
+        result = self.run_json("prune", "--keep", "iPhone 17 Pro", expect=1)
+        self.assertTrue(result["dry_run"])
+        self.assertEqual([d["udid"] for d in result["delete"]], ["GONE"])
+        self.assertEqual([d["udid"] for d in result["skipped_booted"]], ["BOOTED"])
+        self.assertEqual(len(self.fake.devices), 7)
+
+    def test_prune_yes_deletes_unmanaged_only(self):
+        result = self.run_json("prune", "--keep", "iPhone 17 Pro", "--yes")
+        self.assertEqual([d["udid"] for d in result["deleted"]], ["GONE"])
+        self.assertIn(("delete", "GONE"), self.fake.calls)
+        names = self.fake.names()
+        self.assertIn("[other] iPhone 16e", names)
+        self.assertIn("[triton] iPhone 17 Pro", names)
+        self.assertIn("iPhone 17 Pro", names)
+        self.assertIn("Booted Thing", names)
+
+    def test_prune_shutdown_includes_booted(self):
+        result = self.run_json("prune", "--keep", "iPhone 17 Pro", "--shutdown", "--yes")
+        self.assertEqual(sorted(d["udid"] for d in result["deleted"]), ["BOOTED", "GONE"])
+        self.assertIn(("shutdown", "BOOTED"), self.fake.calls)
+
+    def test_prune_works_without_a_project(self):
+        empty = Path(self.tmp.name) / "elsewhere"
+        empty.mkdir()
+        result = self.run_json("prune", "--keep", "iPhone 17 Pro", cwd=empty, expect=1)
+        self.assertTrue(result["dry_run"])
+
+
 if __name__ == "__main__":
     unittest.main()
