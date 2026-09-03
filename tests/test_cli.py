@@ -102,5 +102,19 @@ class ListTests(CliCase):
         self.assertEqual(result["id"], "triton")
 
 
+class GlobalFlagTests(CliCase):
+    def test_project_flag_after_subcommand_resolves_project(self):
+        self.run_json("configure")
+        elsewhere = Path(self.tmp.name) / "elsewhere"
+        elsewhere.mkdir()
+        result = self.run_json("list", "--project", str(self.project), cwd=elsewhere)
+        self.assertEqual(result["id"], "triton")
+
+    def test_json_flag_before_subcommand_yields_json_output(self):
+        self.run_json("configure")
+        out = self.run_cli("--json", "list")
+        self.assertEqual(json.loads(out)["id"], "triton")
+
+
 if __name__ == "__main__":
     unittest.main()

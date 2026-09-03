@@ -169,55 +169,40 @@ def cmd_list(ctx, args):
     return EXIT_OK
 
 
+def add_subcommand(sub, name, help_text, global_options):
+    """Register a subcommand that also accepts --project/--json after the subcommand name."""
+    return sub.add_parser(name, help=help_text, parents=[global_options])
+
+
 def build_parser():
+    global_options = argparse.ArgumentParser(add_help=False)
+    global_options.add_argument("--project", default=argparse.SUPPRESS,
+                                 help="project root (default: nearest .simset.json from cwd upward)")
+    global_options.add_argument("--json", action="store_true", default=argparse.SUPPRESS,
+                                 help="machine-readable output")
+
     parser = argparse.ArgumentParser(prog="simset", description="Project-scoped iOS simulator sets for concurrent agents.")
     parser.add_argument("--project", help="project root (default: nearest .simset.json from cwd upward)")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    p = sub.add_parser("configure", help="create or update this project's simulator set")
+    p = add_subcommand(sub, "configure", "create or update this project's simulator set", global_options)
     p.add_argument("--id", help="set id (default: existing manifest id, else directory name)")
     p.add_argument("--roster", action="append", help="device type name; repeatable (default: iPhone 17 Pro, iPhone 16e, iPad Pro 13-inch (M5))")
     p.add_argument("--runtime", help="iOS runtime policy: latest (default) or a version prefix like 26.3")
     p.add_argument("--no-claude-md", action="store_true", help="do not touch CLAUDE.md")
     p.set_defaults(func=cmd_configure)
 
-    p = sub.add_parser("list", help="list this project's devices (or every simulator with --all)")
+    p = add_subcommand(sub, "list", "list this project's devices (or every simulator with --all)", global_options)
     p.add_argument("--all", action="store_true")
     p.set_defaults(func=cmd_list)
     return parser
 
 
-GLOBAL_FLAGS = {"--json"}
-GLOBAL_FLAGS_WITH_VALUE = {"--project"}
-
-
-def _hoist_global_flags(argv):
-    """argparse only recognizes top-level flags before the subcommand; let --project/--json appear anywhere."""
-    front, rest, tokens = [], [], list(argv)
-    i = 0
-    while i < len(tokens):
-        token = tokens[i]
-        if token in GLOBAL_FLAGS:
-            front.append(token)
-            i += 1
-        elif token in GLOBAL_FLAGS_WITH_VALUE and i + 1 < len(tokens):
-            front.extend(tokens[i:i + 2])
-            i += 2
-        elif any(token.startswith(flag + "=") for flag in GLOBAL_FLAGS_WITH_VALUE):
-            front.append(token)
-            i += 1
-        else:
-            rest.append(token)
-            i += 1
-    return front + rest
-
-
 def main(argv=None, simctl=None, env=None, stdout=None, cwd=None):
     env = os.environ if env is None else env
     stdout = sys.stdout if stdout is None else stdout
-    raw_argv = sys.argv[1:] if argv is None else argv
-    args = build_parser().parse_args(_hoist_global_flags(raw_argv))
+    args = build_parser().parse_args(sys.argv[1:] if argv is None else argv)
     home = simset_home(env)
     ctx = Context(simctl=simctl or Simctl(), home=home, env=env, stdout=stdout,
                   cwd=Path(cwd or os.getcwd()), json=args.json, project_arg=args.project,
