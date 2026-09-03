@@ -27,7 +27,7 @@ Everything must keep working with existing tools: `xcodebuild` (build and test),
 - **Default roster**: iPhone 17 Pro, iPhone 16e (smallest current; Xcode 26.3 has no iPhone 17e device type), iPad Pro 13-inch (M5). Newest available iOS runtime.
 - **Enforcement is instructions only.** No hooks. `configure` writes a CLAUDE.md section.
 - **UI is baguette's `/farm` view, patched to filter by name.** Baguette (`tddworks/baguette`, Apache-2.0, Swift, Xcode 26) streams every booted default-set simulator with input, but its farm filter is family/OS/state only, has no URL parameters, and the server sends `frame-ancestors 'none'` so it cannot be embedded. A fork at `nbonatsakis/baguette` adds a name filter; the skill points at the fork until upstream merges.
-- **Implementation is Python 3 stdlib**, one file, matching Nick's other skills.
+- **Implementation is Python 3 stdlib**: a thin entry script plus a small `simsetlib` package with one module per responsibility, matching Nick's other skills.
 
 ## Architecture
 
@@ -129,7 +129,7 @@ All commands accept `--project <path>` (default: walk up from cwd to the nearest
 - `prune --keep "<Device Type or full name>" ... [--shutdown] [--yes]`
   Deletes every unmanaged default-set device whose name is not in the keep list. Never touches a device whose name parses as `[set] ...` for any registered or unregistered set. Booted devices are skipped unless `--shutdown`. Prints the plan; requires `--yes`.
 - `ui [--all] [--port 8421]`
-  Ensures a baguette server is running (starts `baguette serve --port` detached and records the pid), boots the project's devices, opens `http://127.0.0.1:<port>/farm?name=%5B<id>%5D` with `open`. `--all` opens the unfiltered farm.
+  Ensures a baguette server is running (starts `baguette serve --port` detached and records the pid), boots the project's devices, opens `http://127.0.0.1:<port>/farm?q=%5B<id>%5D` with `open`. `--all` opens the unfiltered farm.
 - `doctor`
   Checks: Xcode and simctl reachable, at least one iOS runtime, `baguette` on PATH and reports whether it supports `?name=` (probes `baguette --version` for the fork marker), registry entries whose project path no longer exists, devices with `[set]` names that belong to no registered set, stale leases.
 
@@ -177,7 +177,7 @@ The skill's SKILL.md documents: install via `~/dev/forks/baguette` and `swift bu
 
 - `tests/test_simset.py` (stdlib `unittest`): naming round-trip; provision planning idempotency; prune planning excludes managed names and booted devices; lease claim picks free device, reaps dead PID, respects TTL, `--grow` naming; CLAUDE.md injection idempotency and preservation of surrounding text; runtime resolution (`latest`, prefix). All through a `FakeSimctl` that records calls and returns canned `simctl list -j` documents.
 - `tests/smoke.sh`: against the real simctl, `configure --id simset-smoke` in a temp project, `claim phone --json`, `list --json`, `release --mine`, `destroy --yes`, asserting no `[simset-smoke]` devices remain.
-- Baguette fork: existing `Tests/Web` runner plus new tests; manual check that `/farm?name=%5Bsimset-smoke%5D` shows only the smoke set.
+- Baguette fork: existing `Tests/Web` runner plus new tests; manual check that `/farm?q=%5Bsimset-smoke%5D` shows only the smoke set.
 
 ## Out of scope
 
