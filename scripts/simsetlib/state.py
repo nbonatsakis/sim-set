@@ -46,6 +46,7 @@ class Manifest:
     id: str
     roster: list = field(default_factory=list)
     runtime: str = "latest"
+    instructions: str | None = None
 
     @classmethod
     def default(cls, set_id):
@@ -54,14 +55,17 @@ class Manifest:
     @classmethod
     def from_dict(cls, data):
         roster = [RosterEntry(e["type"], e.get("alias")) for e in data.get("roster", [])]
-        return cls(data["id"], roster, data.get("runtime", "latest"))
+        return cls(data["id"], roster, data.get("runtime", "latest"), data.get("instructions"))
 
     def to_dict(self):
-        return {
+        data = {
             "id": self.id,
             "roster": [{"type": e.type, "alias": e.alias} for e in self.roster],
             "runtime": self.runtime,
         }
+        if self.instructions:
+            data["instructions"] = self.instructions
+        return data
 
     def roster_types(self):
         return [e.type for e in self.roster]

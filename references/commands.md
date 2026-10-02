@@ -154,6 +154,9 @@ instead).
 - `--ttl HOURS` — lease lifetime, default `4.0`. A lease is stale once its
   owner PID is dead or `expires_at` has passed; `leases --reap` and every
   `claim` call drop stale leases before allocating.
+- `--no-heal` — with `--boot`, skip the Device Hub input repair (see `heal`).
+  By default, once booted, a device Device Hub has attached to is healed and
+  the payload carries `"healed": true` (`false` when there was nothing to do).
 - `--renew UDID` — instead of claiming, extend an existing lease's
   `expires_at` by `--ttl` hours. Errors (exit `1`) if the device no longer
   exists.
@@ -323,6 +326,22 @@ Dry-run JSON output:
 Applied JSON output adds `"deleted": [{"name": "...", "udid": "..."}, ...]` to
 the same payload.
 
+## heal
+
+    simset heal <udid|alias|device type|all>
+
+For each matching booted device in the set: if
+`notifyutil -g com.apple.coredevice.dtuhidd.active` reads `1` (Xcode 27
+Device Hub attached its HID daemon), set it to `0` and run `launchctl
+kickstart -k system/com.apple.backboardd`, then wait for SpringBoard to come
+back under a new pid plus a 2 s settle. Order matters: clearing the state
+after the restart kills the services again. Running apps are killed. The
+repair holds until Device Hub is relaunched.
+
+JSON output:
+
+    {"devices": [{"udid": "...", "name": "[triton] iPhone 17 Pro", "healed": true}]}
+
 ## migrate
 
     simset migrate [--runtime 27.0] [--yes]
@@ -350,7 +369,7 @@ Runs these checks and exits `1` if any fail:
 
 - `simctl` — `xcrun simctl` is reachable
 - `ios-runtime` — at least one available iOS runtime exists
-- `axe`, `mobilebuildmcp` — the recommended UI/run tools are on PATH
+- `axe`, `mobilebuildmcp`, `baguette` — the recommended UI/run/button tools are on PATH
 - `runtime-pin` — (inside a configured project) every device of the set is on
   the pinned runtime
 - `registry` — every entry in `~/.simset/registry.json` still points at a

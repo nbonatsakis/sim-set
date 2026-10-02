@@ -56,6 +56,9 @@ class Simctl:
     def shutdown(self, udid):
         self._call("shutdown", udid)
 
+    def spawn(self, udid, *command):
+        return self._call("spawn", udid, *command)
+
     def upgrade(self, udid, runtime_id):
         self._call("upgrade", udid, runtime_id)
 

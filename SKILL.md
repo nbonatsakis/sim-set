@@ -68,6 +68,10 @@ simset doctor                                       # runtimes, axe + mobilebuil
 
 `prune` never touches a device whose name matches `[set] ...`, registered or not. It also refuses to run at all unless you pass at least one `--keep`, or `--keep-nothing` to explicitly opt into deleting every unmanaged simulator.
 
+## Device Hub input repair
+
+While Xcode 27's Device Hub runs, it attaches a HID daemon to every booted simulator and iOS 27 then disconnects the legacy input services AXe, MobileBuildMCP, and baguette inject into: hardware buttons die and taps can report success while landing nowhere. `claim --boot` checks `notifyutil -g com.apple.coredevice.dtuhidd.active` and, if set, clears it and restarts backboardd (the repair from tddworks/baguette #77); JSON gains `"healed": true`. `--no-heal` skips it. `simset heal <udid|alias|all>` does it on demand (restarts SpringBoard, so running apps die). Separately, short-lived tap commands lose their first event to the daemon's activation gap (AXe #71): pass `--post-delay 0.5` to `mobilebuildmcp ui-automation tap`, and set `AXE_HID_STABILIZATION_MS=250` for direct `axe`. Hardware buttons only work through `baguette press --udid <udid> --button home`.
+
 ## Watching devices
 
 Xcode 27 has no Simulator.app; `open -a DeviceHub` shows every simulator in one window. Agents never need a window: simctl, AXe, and MobileBuildMCP drive devices headless. (The old `simset ui` baguette farm view was removed in favor of Device Hub.)

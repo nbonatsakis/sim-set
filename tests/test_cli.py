@@ -29,7 +29,8 @@ class CliCase(unittest.TestCase):
 
     def _invoke(self, args, cwd):
         out, err = io.StringIO(), io.StringIO()
-        code = cli.main(list(args), simctl=self.fake, env=self.env, stdout=out, stderr=err, cwd=str(cwd or self.project))
+        code = cli.main(list(args), simctl=self.fake, env=self.env, stdout=out, stderr=err, cwd=str(cwd or self.project),
+                        sleep=lambda seconds: None)
         return code, out.getvalue(), err.getvalue()
 
     def run_cli(self, *args, cwd=None, expect=0):
@@ -476,11 +477,47 @@ class ShutdownTests(CliCase):
         self.assertEqual(states["UNMANAGED"], "Booted")
 
 
+class DeviceHubHealTests(CliCase):
+    def setUp(self):
+        super().setUp()
+        self.run_json("configure")
+
+    def test_claim_boot_heals_when_device_hub_attached(self):
+        udid = self.run_json("list")["devices"][0]["udid"]
+        self.fake.hub_attached.add(udid)
+        result = self.run_json("claim", "phone", "--boot")
+        self.assertTrue(result["healed"])
+        spawned = [c[2:] for c in self.fake.calls if c[0] == "spawn"]
+        reset = spawned.index(("notifyutil", "-s", "com.apple.coredevice.dtuhidd.active", "0"))
+        restart = spawned.index(("launchctl", "kickstart", "-k", "system/com.apple.backboardd"))
+        self.assertLess(reset, restart)
+
+    def test_claim_boot_skips_heal_when_not_attached_or_opted_out(self):
+        self.assertFalse(self.run_json("claim", "phone", "--boot")["healed"])
+        self.run_json("release", "--mine")
+        udid = self.run_json("list")["devices"][0]["udid"]
+        self.fake.hub_attached.add(udid)
+        self.assertFalse(self.run_json("claim", "phone", "--boot", "--no-heal")["healed"])
+        self.assertIn(udid, self.fake.hub_attached)
+
+    def test_heal_command_reports_per_device(self):
+        self.run_json("boot", "all")
+        tablet = [d for d in self.run_json("list")["devices"] if d["type"].startswith("iPad")][0]["udid"]
+        self.fake.hub_attached.add(tablet)
+        result = self.run_json("heal", "all")
+        healed = {d["udid"]: d["healed"] for d in result["devices"]}
+        self.assertTrue(healed[tablet])
+        self.assertEqual(sum(healed.values()), 1)
+
+
 class InstructionsFileTests(CliCase):
     def test_configure_can_target_claude_local_md(self):
         self.run_json("configure", "--claude-md", "CLAUDE.local.md")
         self.assertIn("simset:start", (self.project / "CLAUDE.local.md").read_text())
         self.assertFalse((self.project / "CLAUDE.md").exists())
+        self.run_json("configure")
+        self.assertFalse((self.project / "CLAUDE.md").exists())
+        self.assertEqual(json.loads((self.project / ".simset.json").read_text())["instructions"], "CLAUDE.local.md")
 
 
 if __name__ == "__main__":

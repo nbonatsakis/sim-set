@@ -51,6 +51,8 @@ class FakeSimctl:
         self.devicetypes = list(devicetypes or DEFAULT_DEVICETYPES)
         self.runtimes = list(runtimes or DEFAULT_RUNTIMES)
         self.calls = []
+        self.hub_attached = set()
+        self.springboard_pids = {}
 
     def list_devices(self):
         return [dict(d) for d in self.devices]
@@ -88,6 +90,22 @@ class FakeSimctl:
     def shutdown(self, udid):
         self._find(udid)["state"] = "Shutdown"
         self.calls.append(("shutdown", udid))
+
+    def spawn(self, udid, *command):
+        self._find(udid)
+        self.calls.append(("spawn", udid, *command))
+        key = "com.apple.coredevice.dtuhidd.active"
+        if list(command[:2]) == ["notifyutil", "-g"]:
+            return f"{key} {1 if udid in self.hub_attached else 0}\n"
+        if list(command[:2]) == ["notifyutil", "-s"]:
+            self.hub_attached.discard(udid)
+            return ""
+        if list(command[:2]) == ["launchctl", "kickstart"]:
+            self.springboard_pids[udid] = self.springboard_pids.get(udid, 100) + 1
+            return ""
+        if list(command) == ["launchctl", "list"]:
+            return f"42\t0\tcom.apple.backboardd\n{self.springboard_pids.get(udid, 100)}\t0\tcom.apple.SpringBoard\n"
+        return ""
 
     def upgrade(self, udid, runtime_id):
         self._find(udid)["runtime"] = runtime_id

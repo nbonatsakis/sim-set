@@ -8,6 +8,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from . import devicehub
 from .claudemd import DEFAULT_FILENAME, SectionError, remove_from_claude_md, update_claude_md
 from .leases import LeaseError, Leases, find_owner_pid
 from .naming import parse_name
@@ -23,6 +24,7 @@ EXIT_OK, EXIT_USER, EXIT_SIMCTL, EXIT_CONTENTION = 0, 1, 2, 3
 RECOMMENDED_TOOLS = [
     ("axe", "missing; `brew install cameroncooke/axe/axe`"),
     ("mobilebuildmcp", "missing; `brew tap getsentry/xcodebuildmcp && brew install mobilebuildmcp`"),
+    ("baguette", "missing (needed for hardware buttons on iOS 27); `brew install baguette`"),
 ]
 
 
@@ -42,6 +44,7 @@ class Context:
     project_arg: str | None
     registry: Registry
     leases: Leases
+    sleep: object = time.sleep
 
 
 def emit(ctx, payload, human_lines):
@@ -133,7 +136,9 @@ def cmd_configure(ctx, args):
     runtimes = ctx.simctl.list_runtimes()
     policy = args.runtime or (existing.runtime if existing else "latest")
     runtime = resolve_runtime(runtimes, policy)
-    manifest = Manifest(set_id, roster, pin_for(runtime) if policy == "latest" else policy)
+    instructions = args.claude_md or (existing.instructions if existing else None)
+    manifest = Manifest(set_id, roster, pin_for(runtime) if policy == "latest" else policy,
+                        instructions if instructions not in (None, DEFAULT_FILENAME) else None)
 
     devicetypes = ctx.simctl.list_devicetypes()
     for entry in manifest.roster:
@@ -144,7 +149,7 @@ def cmd_configure(ctx, args):
     write_manifest(root, manifest)
     created = [{"name": op.name, "udid": ctx.simctl.create(op.name, op.devicetype_id, op.runtime_id)} for op in ops]
     ctx.registry.register(set_id, root)
-    claude_md = None if args.no_claude_md else str(update_claude_md(root, set_id, args.claude_md))
+    claude_md = None if args.no_claude_md else str(update_claude_md(root, set_id, instructions or DEFAULT_FILENAME))
     drifted = [d["name"] for d in set_devices(ctx.simctl.list_devices(), set_id) if not on_runtime(d, runtime)]
 
     payload = {"id": set_id, "project": str(root), "runtime": runtime["version"], "pinned": manifest.runtime,
@@ -278,11 +283,17 @@ def cmd_claim(ctx, args):
         warning = f"no claude ancestor found; lease bound to short-lived pid {pid}. Set SIMSET_OWNER_PID to a long-lived process id."
 
     device = refetch_device(ctx, lease)
-    if args.boot and device.get("state") != "Booted":
-        ctx.simctl.boot(device["udid"])
-        ctx.simctl.bootstatus(device["udid"])
+    healed = False
+    if args.boot:
+        if device.get("state") != "Booted":
+            ctx.simctl.boot(device["udid"])
+            ctx.simctl.bootstatus(device["udid"])
+        if not args.no_heal:
+            healed = devicehub.heal(ctx.simctl, device["udid"], sleep=ctx.sleep)
         device = refetch_device(ctx, lease)
     payload = claim_payload(ctx, device, lease, type_names)
+    if args.boot:
+        payload["healed"] = healed
     if warning:
         if ctx.json:
             payload["warning"] = warning
@@ -532,6 +543,18 @@ def cmd_migrate(ctx, args):
     return EXIT_OK
 
 
+def cmd_heal(ctx, args):
+    _, manifest = load_project(ctx)
+    targets = [d for d in resolve_targets(ctx, manifest, ctx.simctl.list_devices(), args.target, allow_all=True)
+               if d.get("state") == "Booted"]
+    results = [{"udid": d["udid"], "name": d["name"], "healed": devicehub.heal(ctx.simctl, d["udid"], sleep=ctx.sleep)}
+               for d in targets]
+    emit(ctx, {"devices": results},
+         [f"{'healed' if r['healed'] else 'not shadowed'}: {r['name']} ({r['udid']})" for r in results]
+         or ["no booted devices matched"])
+    return EXIT_OK
+
+
 def cmd_doctor(ctx, args):
     checks = []
 
@@ -599,7 +622,7 @@ def build_parser():
     p.add_argument("--id", help="set id (default: existing manifest id, else directory name)")
     p.add_argument("--roster", action="append", help="device type name; repeatable (default: iPhone 17 Pro, iPhone 17e, iPad Pro 13-inch (M5))")
     p.add_argument("--runtime", help="iOS runtime to pin, e.g. 27.0 (default: keep the existing pin, else pin the newest installed)")
-    p.add_argument("--claude-md", default=DEFAULT_FILENAME, help="instructions file to inject into, relative to the project (default: CLAUDE.md; use CLAUDE.local.md for repos you don't own)")
+    p.add_argument("--claude-md", help="instructions file to inject into, relative to the project; remembered in .simset.json (default: CLAUDE.md; use CLAUDE.local.md for repos you don't own)")
     p.add_argument("--no-claude-md", action="store_true", help="do not touch the instructions file")
     p.set_defaults(func=cmd_configure)
 
@@ -615,6 +638,7 @@ def build_parser():
     p.add_argument("--grow", action="store_true", help="provision another device of this type if none is free")
     p.add_argument("--ttl", type=float, default=4.0, help="lease hours (default 4)")
     p.add_argument("--renew", metavar="UDID", help="extend an existing lease instead of claiming")
+    p.add_argument("--no-heal", action="store_true", help="with --boot: skip reclaiming input from Device Hub")
     p.set_defaults(func=cmd_claim)
 
     p = add_subcommand(sub, "release", "release leases", global_options)
@@ -657,6 +681,10 @@ def build_parser():
     p.add_argument("--yes", action="store_true")
     p.set_defaults(func=cmd_prune)
 
+    p = add_subcommand(sub, "heal", "reclaim input (buttons, taps) on booted devices Device Hub has attached to; kills running apps", global_options)
+    p.add_argument("target", help="udid | alias | device type | all")
+    p.set_defaults(func=cmd_heal)
+
     p = add_subcommand(sub, "migrate", "move this set's devices onto the pinned iOS runtime with `simctl upgrade`", global_options)
     p.add_argument("--runtime", help="change the pin first, e.g. 27.0")
     p.add_argument("--yes", action="store_true")
@@ -667,7 +695,7 @@ def build_parser():
     return parser
 
 
-def main(argv=None, simctl=None, env=None, stdout=None, stderr=None, cwd=None):
+def main(argv=None, simctl=None, env=None, stdout=None, stderr=None, cwd=None, sleep=None):
     env = os.environ if env is None else env
     stdout = sys.stdout if stdout is None else stdout
     stderr = sys.stderr if stderr is None else stderr
@@ -675,12 +703,12 @@ def main(argv=None, simctl=None, env=None, stdout=None, stderr=None, cwd=None):
     home = simset_home(env)
     ctx = Context(simctl=simctl or Simctl(), home=home, env=env, stdout=stdout, stderr=stderr,
                   cwd=Path(cwd or os.getcwd()), json=args.json, project_arg=args.project,
-                  registry=Registry(home), leases=Leases(home))
+                  registry=Registry(home), leases=Leases(home), sleep=sleep or time.sleep)
     try:
         return args.func(ctx, args)
     except SimctlError as error:
         emit_error(ctx, str(error), EXIT_SIMCTL)
         return EXIT_SIMCTL
-    except (UsageError, StateError, PlanningError, LeaseError, SectionError) as error:
+    except (UsageError, StateError, PlanningError, LeaseError, SectionError, devicehub.HealError) as error:
         emit_error(ctx, str(error), EXIT_USER)
         return EXIT_USER
