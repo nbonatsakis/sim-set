@@ -255,7 +255,10 @@ def cmd_claim(ctx, args):
     deadline = time.monotonic() + (args.wait or 0)
     grows = 0
     pid, source = owner_pid(ctx)
-    while True:
+    reused = existing_lease(ctx, manifest, type_name, runtime, pid) if args.reuse else None
+    if reused:
+        lease = ctx.leases.renew(reused.udid, args.ttl)
+    while not reused:
         devices = ctx.simctl.list_devices()
         same_type = matching_devices(devices, manifest.id, type_name)
         candidates = [d for d in same_type if on_runtime(d, runtime)]
@@ -285,13 +288,15 @@ def cmd_claim(ctx, args):
     device = refetch_device(ctx, lease)
     healed = False
     if args.boot:
-        if device.get("state") != "Booted":
+        booted_now = device.get("state") != "Booted"
+        if booted_now:
             ctx.simctl.boot(device["udid"])
             ctx.simctl.bootstatus(device["udid"])
-        if not args.no_heal:
+        if not args.no_heal and (booted_now or not reused):
             healed = devicehub.heal(ctx.simctl, device["udid"], sleep=ctx.sleep)
         device = refetch_device(ctx, lease)
     payload = claim_payload(ctx, device, lease, type_names)
+    payload["reused"] = bool(reused)
     if args.boot:
         payload["healed"] = healed
     if warning:
@@ -303,6 +308,16 @@ def cmd_claim(ctx, args):
                         f"destination {payload['destination']}",
                         f"lease until {lease.expires_at} (pid {lease.owner_pid})"])
     return EXIT_OK
+
+
+def existing_lease(ctx, manifest, type_name, runtime, pid):
+    """A live lease this owner already holds on a device of this type in the set, if any."""
+    devices = {d["udid"]: d for d in matching_devices(ctx.simctl.list_devices(), manifest.id, type_name)
+               if on_runtime(d, runtime)}
+    for lease in ctx.leases.all():
+        if lease.owner_pid == pid and lease.udid in devices and not ctx.leases.is_stale(lease):
+            return lease
+    return None
 
 
 def cmd_release(ctx, args):
@@ -639,6 +654,7 @@ def build_parser():
     p.add_argument("--ttl", type=float, default=4.0, help="lease hours (default 4)")
     p.add_argument("--renew", metavar="UDID", help="extend an existing lease instead of claiming")
     p.add_argument("--no-heal", action="store_true", help="with --boot: skip reclaiming input from Device Hub")
+    p.add_argument("--reuse", action="store_true", help="return (and renew) a device of this type you already lease, else claim one; for scripts called repeatedly")
     p.set_defaults(func=cmd_claim)
 
     p = add_subcommand(sub, "release", "release leases", global_options)

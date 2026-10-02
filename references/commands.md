@@ -154,6 +154,11 @@ instead).
 - `--ttl HOURS` — lease lifetime, default `4.0`. A lease is stale once its
   owner PID is dead or `expires_at` has passed; `leases --reap` and every
   `claim` call drop stale leases before allocating.
+- `--reuse` — if the caller already holds a live lease on a device of this
+  type in the set (on the pinned runtime), renew and return it instead of
+  claiming another; otherwise claim as usual. For drivers and scripts that are
+  invoked once per step. The payload carries `"reused": true|false`. A reused,
+  already-booted device is not healed (that would kill the running app).
 - `--no-heal` — with `--boot`, skip the Device Hub input repair (see `heal`).
   By default, once booted, a device Device Hub has attached to is healed and
   the payload carries `"healed": true` (`false` when there was nothing to do).

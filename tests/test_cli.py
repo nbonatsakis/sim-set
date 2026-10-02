@@ -477,6 +477,27 @@ class ShutdownTests(CliCase):
         self.assertEqual(states["UNMANAGED"], "Booted")
 
 
+class ReuseTests(CliCase):
+    def setUp(self):
+        super().setUp()
+        self.run_json("configure")
+
+    def test_reuse_returns_my_existing_lease_instead_of_contending(self):
+        first = self.run_json("claim", "phone", "--boot")
+        again = self.run_json("claim", "phone", "--boot", "--reuse")
+        self.assertEqual(again["udid"], first["udid"])
+        self.assertTrue(again["reused"])
+        self.assertFalse(again["healed"])
+
+    def test_reuse_claims_when_i_hold_nothing_and_ignores_other_owners(self):
+        self.env["SIMSET_OWNER_PID"] = "1"
+        self.run_json("claim", "phone")
+        self.env["SIMSET_OWNER_PID"] = str(os.getpid())
+        self.run_cli("claim", "phone", "--reuse", expect=3)
+        result = self.run_json("claim", "tablet", "--reuse")
+        self.assertFalse(result["reused"])
+
+
 class DeviceHubHealTests(CliCase):
     def setUp(self):
         super().setUp()

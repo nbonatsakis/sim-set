@@ -7,6 +7,7 @@ Claim, use, release:
 
 - Claim before touching a simulator: `simset claim phone --label "<what you are doing>" --boot --json`. Aliases are `phone`, `phone-small`, `tablet`, or an exact device type such as `"iPhone 17 Pro Max"`. `--boot` returns only once the device has finished booting, and it also reclaims input from Device Hub (see below).
 - Use the returned `udid` and `destination` everywhere. Never pick a device by name and never use the `booted` alias: several simulators are usually booted and the same device names exist on more than one runtime.
+- Scripts and drivers that run once per step use `simset claim phone --reuse --boot --json`: it returns the device you already hold instead of claiming another. Don't cache udids in files; a cached udid outlives its lease.
 - If every device of a size is taken, `--wait 300` waits for one and `--grow` provisions another (both: wait first, then grow).
 - Leases last 4 hours (`--ttl`); renew with `simset claim --renew <udid>`. When done, `simset release --mine`, which also shuts the device down.
 - If `claim` says the devices are on another runtime, run `simset migrate --yes`. Never create, delete, erase, or boot simulators outside this set.
