@@ -9,6 +9,7 @@ from simsetlib.simctl import SimctlError
 IPHONE_17_PRO = "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro"
 IPHONE_17_PRO_MAX = "com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro-Max"
 IPHONE_16E = "com.apple.CoreSimulator.SimDeviceType.iPhone-16e"
+IPHONE_17E = "com.apple.CoreSimulator.SimDeviceType.iPhone-17e"
 IPAD_PRO_13 = "com.apple.CoreSimulator.SimDeviceType.iPad-Pro-13-inch-M5-12GB"
 IOS_26_3 = "com.apple.CoreSimulator.SimRuntime.iOS-26-3"
 IOS_18_4 = "com.apple.CoreSimulator.SimRuntime.iOS-18-4"
@@ -17,6 +18,7 @@ DEFAULT_DEVICETYPES = [
     {"identifier": IPHONE_17_PRO, "name": "iPhone 17 Pro"},
     {"identifier": IPHONE_17_PRO_MAX, "name": "iPhone 17 Pro Max"},
     {"identifier": IPHONE_16E, "name": "iPhone 16e"},
+    {"identifier": IPHONE_17E, "name": "iPhone 17e"},
     {"identifier": IPAD_PRO_13, "name": "iPad Pro 13-inch (M5)"},
 ]
 
@@ -86,6 +88,10 @@ class FakeSimctl:
     def shutdown(self, udid):
         self._find(udid)["state"] = "Shutdown"
         self.calls.append(("shutdown", udid))
+
+    def upgrade(self, udid, runtime_id):
+        self._find(udid)["runtime"] = runtime_id
+        self.calls.append(("upgrade", udid, runtime_id))
 
     def erase(self, udid):
         self._find(udid)

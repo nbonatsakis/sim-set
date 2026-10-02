@@ -27,11 +27,11 @@ JSON document on **stdout** instead: `{"error": "<message>", "exit_code": N}`,
 where `N` matches the process exit code. This applies uniformly — the
 exception handlers in `main` (missing manifest, unknown device type, lease
 errors, `SimctlError`, a malformed CLAUDE.md), `claim`'s contention message,
-and `ui`'s missing/timeout messages all go through the same helper.
+and `migrate`/`prune` dry runs all go through the same helper.
 
 ## configure
 
-    simset configure [--id ID] [--roster "Device Type"]... [--runtime latest|26.3] [--no-claude-md]
+    simset configure [--id ID] [--roster "Device Type"]... [--runtime 27.0] [--claude-md FILE] [--no-claude-md]
 
 Creates or updates the project's `.simset.json`, provisions any roster device
 that does not already exist, registers the set in `~/.simset/registry.json`,
@@ -47,14 +47,21 @@ deletes a device. Safe to re-run.
   beyond those (a second tablet, a third phone) gets no alias and must be
   claimed by its exact type name. Omit this flag to keep the existing roster,
   or fall back to the default roster on first configure.
-- `--runtime latest|26.3` — runtime policy stored in the manifest. Default:
-  the existing manifest's policy, else `latest`.
-- `--no-claude-md` — skip the `CLAUDE.md` edit.
+- `--runtime 27.0` — iOS runtime to pin (a version prefix). Default: the
+  existing manifest's pin, else the newest installed iOS runtime, stored as
+  major.minor. A legacy `"latest"` manifest is converted to a concrete pin on
+  the next configure.
+- `--claude-md FILE` — instructions file to inject into, relative to the
+  project. Default `CLAUDE.md`; use `CLAUDE.local.md` for repos you don't own.
+- `--no-claude-md` — skip the instructions edit.
+
+Devices of the set that sit on another runtime are reported in `off_runtime`
+and are not duplicated; move them with `simset migrate --yes`.
 
 Default roster when none exists yet:
 
 - `iPhone 17 Pro` → alias `phone`
-- `iPhone 16e` → alias `phone-small`
+- `iPhone 17e` → alias `phone-small`
 - `iPad Pro 13-inch (M5)` → alias `tablet`
 
 JSON output:
@@ -62,10 +69,12 @@ JSON output:
     {
       "id": "triton",
       "project": "/path/to/project",
-      "runtime": "26.3",
+      "runtime": "27.0",
+      "pinned": "27.0",
       "created": [{"name": "[triton] iPhone 17 Pro", "udid": "..."}],
       "roster": [{"type": "iPhone 17 Pro", "alias": "phone"}, ...],
-      "claude_md": "/path/to/project/CLAUDE.md"
+      "claude_md": "/path/to/project/CLAUDE.md",
+      "off_runtime": []
     }
 
 `created` is empty when every roster device already exists. `claude_md` is
@@ -121,7 +130,10 @@ JSON output, `--all`:
 Leases one unleased device of the given size or exact type from the project's
 set. `<target>` is resolved through the size-alias rules below, then must
 name a type that is actually in the roster (add it first with `simset add` if
-not).
+not). Only devices on the pinned runtime are candidates; if every device of
+that type is on another runtime, `claim` exits `1` pointing at `simset
+migrate` (with `--grow` it provisions a new device on the pinned runtime
+instead).
 
 - `--label TEXT` — free-text note shown in `list`/`leases` output.
 - `--boot` — boot the claimed device if it isn't already `Booted`. `claim`
@@ -162,30 +174,36 @@ JSON output (claim or renew) — a device row plus `set`:
       "state": "Booted", "runtime": "iOS-26-3", "available": true,
       "lease": {"owner_pid": 4242, "owner_source": "env", "label": "onboarding fix",
                 "expires_at": "...", "stale": false},
-      "set": "triton"
+      "set": "triton",
+      "destination": "platform=iOS Simulator,id=..."
     }
+
+`destination` is ready to pass to `xcodebuild -destination`.
 
 ## release
 
-    simset release <udid> | --mine | --all
+    simset release <udid> | --mine | --all [--keep-booted]
 
 At least one of a `udid`, `--mine`, or `--all` is required (else exit `1`).
 If more than one is given, `--mine` wins over `--all`, which wins over a
 `udid`. `--mine` releases every lease owned by the calling agent's PID;
 `--all` releases every lease in the current project's set, regardless of
-owner.
+owner. Released devices that are booted and no longer leased are shut down
+unless `--keep-booted` is passed.
 
 JSON output:
 
-    {"released": ["udid1", "udid2"]}
+    {"released": ["udid1", "udid2"], "shutdown": ["udid1"]}
 
 ## leases
 
-    simset leases [--reap]
+    simset leases [--reap [--shutdown-idle]]
 
 Without `--reap`, lists every lease across every set (not scoped to a
-project). With `--reap`, deletes stale ones first and reports what was
-removed.
+project). With `--reap`, deletes stale ones, shuts down their devices if
+booted, and reports what was removed. `--shutdown-idle` also shuts down every
+booted `[set]` device (any set) that nobody leases; unmanaged devices are
+never touched.
 
 Lease record fields (also the schema of `~/.simset/leases/<udid>.json`):
 
@@ -201,7 +219,7 @@ JSON output:
 
 `--reap` JSON output:
 
-    {"reaped": [{...lease fields...}, ...]}
+    {"reaped": [{...lease fields...}, ...], "shutdown": ["udid", ...]}
 
 ## boot / shutdown / erase
 
@@ -305,38 +323,36 @@ Dry-run JSON output:
 Applied JSON output adds `"deleted": [{"name": "...", "udid": "..."}, ...]` to
 the same payload.
 
-## ui
+## migrate
 
-    simset ui [--all] [--port 8421]
+    simset migrate [--runtime 27.0] [--yes]
 
-Boots every device in the project's set that isn't already booted, makes
-sure a `baguette serve --port <port>` is running (starting one detached and
-recording its pid under `~/.simset/baguette.pid` if not), and opens the farm
-view with `open`. Without `--all`, the URL is filtered to this set:
-`http://127.0.0.1:<port>/farm?q=%5B<id>%5D`; `--all` opens
-`http://127.0.0.1:<port>/farm` unfiltered.
+Moves the set's devices onto the pinned runtime in place with `xcrun simctl
+upgrade <udid> <runtime>`, keeping names and udids. `--runtime` changes the
+pin first. Without `--yes` it is a dry run (exit `1`, `dry_run: true`).
+Booted devices are shut down before upgrading; leased devices are skipped;
+devices on a newer runtime than the pin can't be downgraded and are reported.
 
-If `baguette` is not on PATH, or it doesn't answer within 10 seconds of being
-started, this prints a plain-text message (not JSON) and exits `1` — devices
-are still booted either way.
+JSON output:
 
-JSON output on success:
-
-    {"url": "http://127.0.0.1:8421/farm?q=%5Btriton%5D", "baguette": "running"}
-
-`baguette` is `"running"` (already up) or `"started"` (simset started it).
+    {
+      "runtime": "27.0", "pinned": "27.0",
+      "upgrade": [{"name": "...", "udid": "...", "state": "Shutdown"}],
+      "skipped_leased": [], "newer_than_pin": [],
+      "upgraded": [...]
+    }
 
 ## doctor
 
     simset doctor
 
-Runs six checks and exits `1` if any fail:
+Runs these checks and exits `1` if any fail:
 
 - `simctl` — `xcrun simctl` is reachable
 - `ios-runtime` — at least one available iOS runtime exists
-- `baguette` — the binary is on PATH; if it's already running, whether it
-  answers the `?q=` farm filter (probed via `farm-filter.js`, not a version
-  string)
+- `axe`, `mobilebuildmcp` — the recommended UI/run tools are on PATH
+- `runtime-pin` — (inside a configured project) every device of the set is on
+  the pinned runtime
 - `registry` — every entry in `~/.simset/registry.json` still points at a
   project directory that exists
 - `orphan-sets` — every `[set]`-named device on the machine belongs to a
@@ -350,7 +366,9 @@ JSON output:
       "checks": [
         {"name": "simctl", "ok": true, "detail": "xcrun simctl reachable"},
         {"name": "ios-runtime", "ok": true, "detail": "26.3"},
-        {"name": "baguette", "ok": false, "detail": "baguette not found on PATH. Until the name-filter change is merged upstream, build the fork:"},
+        {"name": "axe", "ok": true, "detail": "/opt/homebrew/bin/axe"},
+        {"name": "mobilebuildmcp", "ok": true, "detail": "/opt/homebrew/bin/mobilebuildmcp"},
+        {"name": "runtime-pin", "ok": true, "detail": "[triton] pinned to iOS 27.0"},
         {"name": "registry", "ok": true, "detail": "1 registered sets"},
         {"name": "orphan-sets", "ok": true, "detail": "every managed set is registered"},
         {"name": "leases", "ok": true, "detail": "0 active leases"}
@@ -390,15 +408,16 @@ entry gets `tablet`, and anything past those three gets no alias.
       "id": "triton",
       "roster": [
         {"type": "iPhone 17 Pro", "alias": "phone"},
-        {"type": "iPhone 16e", "alias": "phone-small"},
+        {"type": "iPhone 17e", "alias": "phone-small"},
         {"type": "iPad Pro 13-inch (M5)", "alias": "tablet"}
       ],
-      "runtime": "latest"
+      "runtime": "27.0"
     }
 
-`runtime` is `"latest"` or a version prefix like `"26.3"`; resolution picks
-the newest available iOS runtime whose version equals or starts with that
-prefix.
+`runtime` is a version prefix like `"27.0"`; resolution picks the newest
+available iOS runtime whose version equals or starts with that prefix.
+`"latest"` is still accepted (older manifests) and is replaced by a concrete
+pin on the next `configure`.
 
 `~/.simset/registry.json`:
 
@@ -411,7 +430,7 @@ field list (`udid`, `name`, `set_id`, `owner_pid`, `owner_source`, `label`,
 ## Environment
 
 - `SIMSET_HOME` — overrides `~/.simset` for all machine-local state
-  (registry, leases, `baguette.pid`).
+  (registry, leases).
 - `SIMSET_OWNER_PID` — when set to a numeric pid, `claim` binds new leases to
   that pid instead of walking the process tree for an ancestor named
   `claude`.

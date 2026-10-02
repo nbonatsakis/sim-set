@@ -9,6 +9,9 @@ BLOCK_RE = re.compile(re.escape(START) + r".*?" + re.escape(END) + r"\n?", re.DO
 SEAM_RE = re.compile(r"\n*" + re.escape(START) + r".*?" + re.escape(END) + r"\n*", re.DOTALL)
 
 
+DEFAULT_FILENAME = "CLAUDE.md"
+
+
 class SectionError(Exception):
     pass
 
@@ -44,16 +47,18 @@ def remove_section(text):
     return before.rstrip("\n") + "\n\n" + after
 
 
-def update_claude_md(project_root, set_id):
-    path = Path(project_root) / "CLAUDE.md"
+def update_claude_md(project_root, set_id, filename=DEFAULT_FILENAME):
+    path = Path(project_root) / filename
     existing = path.read_text() if path.exists() else ""
     path.write_text(inject_section(existing, render_section(set_id)))
     return path
 
 
 def remove_from_claude_md(project_root):
-    path = Path(project_root) / "CLAUDE.md"
-    if not path.exists() or START not in path.read_text():
-        return False
-    path.write_text(remove_section(path.read_text()))
-    return True
+    removed = False
+    for filename in (DEFAULT_FILENAME, "CLAUDE.local.md"):
+        path = Path(project_root) / filename
+        if path.exists() and START in path.read_text():
+            path.write_text(remove_section(path.read_text()))
+            removed = True
+    return removed

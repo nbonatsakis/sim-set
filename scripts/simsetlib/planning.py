@@ -21,6 +21,21 @@ def resolve_runtime(runtimes, policy="latest"):
     return max(candidates, key=lambda r: _version_tuple(r["version"]))
 
 
+def pin_for(runtime):
+    """The major.minor pin for a resolved runtime, e.g. "27.0" for 27.0 or "26.3" for 26.3.1."""
+    return ".".join(runtime["version"].split(".")[:2])
+
+
+def runtime_version_of(runtime_id):
+    """(27, 0) for com.apple.CoreSimulator.SimRuntime.iOS-27-0."""
+    tail = runtime_id.rsplit(".", 1)[-1]
+    return tuple(int(part) for part in tail.split("-")[1:] if part.isdigit())
+
+
+def on_runtime(device, runtime):
+    return device.get("runtime") == runtime["identifier"]
+
+
 def resolve_devicetype(devicetypes, type_name):
     for devicetype in devicetypes:
         if devicetype["name"] == type_name:

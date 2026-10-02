@@ -8,17 +8,22 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from . import baguette
-from .claudemd import SectionError, remove_from_claude_md, update_claude_md
+from .claudemd import DEFAULT_FILENAME, SectionError, remove_from_claude_md, update_claude_md
 from .leases import LeaseError, Leases, find_owner_pid
 from .naming import parse_name
-from .planning import (PlanningError, grow_op, matching_devices, plan_provision, plan_prune, resolve_devicetype,
-                       resolve_runtime, resolve_type, set_devices, type_names_by_id)
+from .planning import (PlanningError, grow_op, matching_devices, on_runtime, pin_for, plan_provision, plan_prune,
+                       resolve_devicetype, resolve_runtime, resolve_type, runtime_version_of, set_devices,
+                       type_names_by_id)
 from .simctl import Simctl, SimctlError
 from .state import (Manifest, Registry, RosterEntry, StateError, find_project_root, load_manifest,
                     manifest_path, simset_home, write_manifest)
 
 EXIT_OK, EXIT_USER, EXIT_SIMCTL, EXIT_CONTENTION = 0, 1, 2, 3
+
+RECOMMENDED_TOOLS = [
+    ("axe", "missing; `brew install cameroncooke/axe/axe`"),
+    ("mobilebuildmcp", "missing; `brew tap getsentry/xcodebuildmcp && brew install mobilebuildmcp`"),
+]
 
 
 class UsageError(Exception):
@@ -125,25 +130,32 @@ def cmd_configure(ctx, args):
             roster.append(RosterEntry(type_name, alias))
     else:
         roster = existing.roster if existing else Manifest.default(set_id).roster
-    manifest = Manifest(set_id, roster, args.runtime or (existing.runtime if existing else "latest"))
+    runtimes = ctx.simctl.list_runtimes()
+    policy = args.runtime or (existing.runtime if existing else "latest")
+    runtime = resolve_runtime(runtimes, policy)
+    manifest = Manifest(set_id, roster, pin_for(runtime) if policy == "latest" else policy)
 
     devicetypes = ctx.simctl.list_devicetypes()
     for entry in manifest.roster:
         resolve_devicetype(devicetypes, entry.type)
-    runtime = resolve_runtime(ctx.simctl.list_runtimes(), manifest.runtime)
-    ops = plan_provision(manifest, ctx.simctl.list_devices(), devicetypes, runtime)
+    devices = ctx.simctl.list_devices()
+    ops = plan_provision(manifest, devices, devicetypes, runtime)
 
     write_manifest(root, manifest)
     created = [{"name": op.name, "udid": ctx.simctl.create(op.name, op.devicetype_id, op.runtime_id)} for op in ops]
     ctx.registry.register(set_id, root)
-    claude_md = None if args.no_claude_md else str(update_claude_md(root, set_id))
+    claude_md = None if args.no_claude_md else str(update_claude_md(root, set_id, args.claude_md))
+    drifted = [d["name"] for d in set_devices(ctx.simctl.list_devices(), set_id) if not on_runtime(d, runtime)]
 
-    payload = {"id": set_id, "project": str(root), "runtime": runtime["version"], "created": created,
-               "roster": manifest.to_dict()["roster"], "claude_md": claude_md}
-    lines = [f"set [{set_id}] configured for {root} on iOS {runtime['version']}"]
+    payload = {"id": set_id, "project": str(root), "runtime": runtime["version"], "pinned": manifest.runtime,
+               "created": created, "roster": manifest.to_dict()["roster"], "claude_md": claude_md,
+               "off_runtime": drifted}
+    lines = [f"set [{set_id}] configured for {root}, pinned to iOS {manifest.runtime} ({runtime['version']})"]
     lines += [f"  created {c['name']} ({c['udid']})" for c in created] or ["  all roster devices already exist"]
+    if drifted:
+        lines.append(f"  {len(drifted)} devices are on another runtime; run `simset migrate --yes`")
     if claude_md:
-        lines.append(f"  CLAUDE.md section updated: {claude_md}")
+        lines.append(f"  agent instructions updated: {claude_md}")
     emit(ctx, payload, lines)
     return EXIT_OK
 
@@ -186,9 +198,14 @@ def owner_pid(ctx):
     return find_owner_pid(ctx.env)
 
 
+def destination_for(udid):
+    return f"platform=iOS Simulator,id={udid}"
+
+
 def claim_payload(ctx, device, lease, type_names):
     row = device_row(device, lease, type_names, ctx.leases)
     row["set"] = lease.set_id
+    row["destination"] = destination_for(device["udid"])
     return row
 
 
@@ -229,12 +246,17 @@ def cmd_claim(ctx, args):
     if type_name not in manifest.roster_types():
         raise UsageError(f"{type_name!r} is not in set [{manifest.id}]; run `simset add \"{type_name}\"` first")
 
+    runtime = resolve_runtime(ctx.simctl.list_runtimes(), manifest.runtime)
     deadline = time.monotonic() + (args.wait or 0)
     grows = 0
     pid, source = owner_pid(ctx)
     while True:
         devices = ctx.simctl.list_devices()
-        candidates = matching_devices(devices, manifest.id, type_name)
+        same_type = matching_devices(devices, manifest.id, type_name)
+        candidates = [d for d in same_type if on_runtime(d, runtime)]
+        if same_type and not candidates and not args.grow:
+            raise UsageError(f"every [{manifest.id}] {type_name} is on another runtime than the pinned iOS "
+                             f"{manifest.runtime}; run `simset migrate --yes` (or claim with --grow)")
         lease = ctx.leases.claim(candidates, manifest.id, pid, source, args.label or "", args.ttl)
         if lease:
             break
@@ -245,7 +267,6 @@ def cmd_claim(ctx, args):
             if grows >= MAX_GROWS_PER_CLAIM:
                 raise UsageError(f"gave up after growing [{manifest.id}] {type_name} {MAX_GROWS_PER_CLAIM} times; still contended")
             grows += 1
-            runtime = resolve_runtime(ctx.simctl.list_runtimes(), manifest.runtime)
             op = grow_op(manifest, devices, ctx.simctl.list_devicetypes(), runtime, type_name)
             ctx.simctl.create(op.name, op.devicetype_id, op.runtime_id)
             continue
@@ -268,6 +289,7 @@ def cmd_claim(ctx, args):
         else:
             ctx.stderr.write(f"warning: {warning}\n")
     emit(ctx, payload, [f"claimed {device['name']}", f"udid {device['udid']}", f"state {device['state']}",
+                        f"destination {payload['destination']}",
                         f"lease until {lease.expires_at} (pid {lease.owner_pid})"])
     return EXIT_OK
 
@@ -285,14 +307,37 @@ def cmd_release(ctx, args):
     else:
         raise UsageError("release needs a udid, --mine, or --all")
     udids = [lease.udid for lease in released if lease]
-    emit(ctx, {"released": udids}, [f"released {u}" for u in udids] or ["nothing to release"])
+    shut = [] if args.keep_booted else shutdown_unleased(ctx, udids)
+    emit(ctx, {"released": udids, "shutdown": shut},
+         [f"released {u}" + (" (shut down)" if u in shut else "") for u in udids] or ["nothing to release"])
     return EXIT_OK
+
+
+def shutdown_unleased(ctx, udids):
+    """Shut down the given devices if they are booted and nobody holds a lease on them."""
+    held = {lease.udid for lease in ctx.leases.all()}
+    booted = {d["udid"] for d in ctx.simctl.list_devices() if d.get("state") == "Booted"}
+    shut = []
+    for udid in udids:
+        if udid in booted and udid not in held:
+            try:
+                ctx.simctl.shutdown(udid)
+                shut.append(udid)
+            except SimctlError:
+                pass
+    return shut
 
 
 def cmd_leases(ctx, args):
     if args.reap:
         reaped = ctx.leases.reap()
-        emit(ctx, {"reaped": [l.to_dict() for l in reaped]}, [f"reaped {l.udid} ({l.name})" for l in reaped] or ["no stale leases"])
+        targets = [l.udid for l in reaped]
+        if args.shutdown_idle:
+            targets += [d["udid"] for d in ctx.simctl.list_devices() if parse_name(d["name"])]
+        shut = shutdown_unleased(ctx, list(dict.fromkeys(targets)))
+        lines = [f"reaped {l.udid} ({l.name})" for l in reaped] or ["no stale leases"]
+        lines += [f"shut down {u}" for u in shut]
+        emit(ctx, {"reaped": [l.to_dict() for l in reaped], "shutdown": shut}, lines)
         return EXIT_OK
     rows = [{**l.to_dict(), "stale": ctx.leases.is_stale(l)} for l in ctx.leases.all()]
     lines = [f"{r['udid']}  {r['name']}  pid {r['owner_pid']}  until {r['expires_at']}" + ("  [stale]" if r["stale"] else "")
@@ -449,21 +494,41 @@ def cmd_prune(ctx, args):
     return EXIT_OK
 
 
-def cmd_ui(ctx, args):
-    _, manifest = load_project(ctx)
+def cmd_migrate(ctx, args):
+    root, manifest = load_project(ctx)
+    if args.runtime:
+        manifest.runtime = args.runtime
+    runtime = resolve_runtime(ctx.simctl.list_runtimes(), manifest.runtime)
+    held = {lease.udid for lease in ctx.leases.all()}
+    target = runtime_version_of(runtime["identifier"])
+    upgrade, leased, newer = [], [], []
     for device in set_devices(ctx.simctl.list_devices(), manifest.id):
-        if device.get("state") != "Booted":
-            ctx.simctl.boot(device["udid"])
-    status = baguette.ensure_running(args.port, ctx.home)
-    url = baguette.farm_url(args.port, None if args.all else manifest.id)
-    if status == "missing":
-        emit_error(ctx, f"booted [{manifest.id}] devices, but cannot open the UI. {baguette.INSTALL_HINT}", EXIT_USER)
-        return EXIT_USER
-    if status == "timeout":
-        emit_error(ctx, f"baguette did not answer on port {args.port} after 10s", EXIT_USER)
-        return EXIT_USER
-    baguette.open_url(url)
-    emit(ctx, {"url": url, "baguette": status}, [f"opened {url} (baguette {status})"])
+        if on_runtime(device, runtime):
+            continue
+        if runtime_version_of(device.get("runtime", "")) > target:
+            newer.append(device)
+        elif device["udid"] in held:
+            leased.append(device)
+        else:
+            upgrade.append(device)
+    payload = {"runtime": runtime["version"], "pinned": manifest.runtime, "upgrade": [brief(d) for d in upgrade],
+               "skipped_leased": [brief(d) for d in leased], "newer_than_pin": [brief(d) for d in newer]}
+    lines = [f"pin [{manifest.id}] to iOS {manifest.runtime} ({runtime['version']})"]
+    lines += [f"would upgrade {d['name']} ({d['udid']})" for d in upgrade] or ["every device is already on the pinned runtime"]
+    lines += [f"skipping leased {d['name']}" for d in leased]
+    lines += [f"cannot downgrade {d['name']}; `simset remove` it if unwanted" for d in newer]
+    blocked = require_yes(ctx, args, payload, lines)
+    if blocked:
+        return blocked
+    write_manifest(root, manifest)
+    upgraded = []
+    for device in upgrade:
+        if device.get("state") != "Shutdown":
+            ctx.simctl.shutdown(device["udid"])
+        ctx.simctl.upgrade(device["udid"], runtime["identifier"])
+        upgraded.append(brief(device))
+    emit(ctx, {**payload, "upgraded": upgraded},
+         [f"upgraded {d['name']} to iOS {runtime['version']}" for d in upgraded] or ["nothing to upgrade"])
     return EXIT_OK
 
 
@@ -482,15 +547,8 @@ def cmd_doctor(ctx, args):
     ios = [r for r in runtimes if r.get("platform") == "iOS" and r.get("isAvailable")]
     check("ios-runtime", ios, ", ".join(sorted(r["version"] for r in ios)) or "no available iOS runtime; run `xcodebuild -downloadPlatform iOS`")
 
-    binary = shutil.which("baguette")
-    if not binary:
-        check("baguette", False, baguette.INSTALL_HINT.splitlines()[0])
-    elif baguette.is_running(baguette.DEFAULT_PORT):
-        supported = baguette.supports_query_filter(baguette.DEFAULT_PORT)
-        check("baguette", supported,
-              f"{binary} running; ?q= filter " + ("supported" if supported else "NOT supported, build the fork"))
-    else:
-        check("baguette", True, f"{binary} (not running; `simset ui` starts it)")
+    for tool, hint in RECOMMENDED_TOOLS:
+        check(tool, shutil.which(tool), shutil.which(tool) or hint)
 
     registered = ctx.registry.sets()
     missing = [sid for sid, info in registered.items() if not Path(info["project"]).exists()]
@@ -500,6 +558,17 @@ def cmd_doctor(ctx, args):
     seen = {parse_name(d["name"]).set_id for d in devices if parse_name(d["name"])}
     orphans = sorted(seen - set(registered))
     check("orphan-sets", not orphans, ("orphan sets with devices but no registry entry: " + ", ".join(f"[{s}]" for s in orphans)) if orphans else "every managed set is registered")
+
+    root = find_project_root(ctx.cwd) if not ctx.project_arg else Path(ctx.project_arg).expanduser().resolve()
+    if root and manifest_path(root).exists() and ios:
+        manifest = load_manifest(root)
+        try:
+            runtime = resolve_runtime(runtimes, manifest.runtime)
+            drifted = [d["name"] for d in set_devices(devices, manifest.id) if not on_runtime(d, runtime)]
+            check("runtime-pin", not drifted, f"[{manifest.id}] pinned to iOS {manifest.runtime}" +
+                  (f"; {len(drifted)} devices on another runtime, run `simset migrate --yes`" if drifted else ""))
+        except PlanningError as error:
+            check("runtime-pin", False, str(error))
 
     stale = [l for l in ctx.leases.all() if ctx.leases.is_stale(l)]
     check("leases", not stale, f"{len(stale)} stale leases; run `simset leases --reap`" if stale else f"{len(ctx.leases.all())} active leases")
@@ -528,9 +597,10 @@ def build_parser():
 
     p = add_subcommand(sub, "configure", "create or update this project's simulator set", global_options)
     p.add_argument("--id", help="set id (default: existing manifest id, else directory name)")
-    p.add_argument("--roster", action="append", help="device type name; repeatable (default: iPhone 17 Pro, iPhone 16e, iPad Pro 13-inch (M5))")
-    p.add_argument("--runtime", help="iOS runtime policy: latest (default) or a version prefix like 26.3")
-    p.add_argument("--no-claude-md", action="store_true", help="do not touch CLAUDE.md")
+    p.add_argument("--roster", action="append", help="device type name; repeatable (default: iPhone 17 Pro, iPhone 17e, iPad Pro 13-inch (M5))")
+    p.add_argument("--runtime", help="iOS runtime to pin, e.g. 27.0 (default: keep the existing pin, else pin the newest installed)")
+    p.add_argument("--claude-md", default=DEFAULT_FILENAME, help="instructions file to inject into, relative to the project (default: CLAUDE.md; use CLAUDE.local.md for repos you don't own)")
+    p.add_argument("--no-claude-md", action="store_true", help="do not touch the instructions file")
     p.set_defaults(func=cmd_configure)
 
     p = add_subcommand(sub, "list", "list this project's devices (or every simulator with --all)", global_options)
@@ -551,10 +621,12 @@ def build_parser():
     p.add_argument("udid", nargs="?")
     p.add_argument("--mine", action="store_true", help="release every lease owned by this agent")
     p.add_argument("--all", action="store_true", help="release every lease in this project's set")
+    p.add_argument("--keep-booted", action="store_true", help="do not shut released devices down")
     p.set_defaults(func=cmd_release)
 
     p = add_subcommand(sub, "leases", "show leases across all sets", global_options)
-    p.add_argument("--reap", action="store_true", help="delete stale leases")
+    p.add_argument("--reap", action="store_true", help="delete stale leases and shut their devices down")
+    p.add_argument("--shutdown-idle", action="store_true", help="with --reap: also shut down every booted [set] device nobody leases")
     p.set_defaults(func=cmd_leases)
 
     for name, func, help_text in [("boot", cmd_boot, "boot devices in this set"),
@@ -585,12 +657,12 @@ def build_parser():
     p.add_argument("--yes", action="store_true")
     p.set_defaults(func=cmd_prune)
 
-    p = add_subcommand(sub, "ui", "boot this set and open the baguette farm filtered to it", global_options)
-    p.add_argument("--all", action="store_true", help="open the unfiltered farm")
-    p.add_argument("--port", type=int, default=baguette.DEFAULT_PORT)
-    p.set_defaults(func=cmd_ui)
+    p = add_subcommand(sub, "migrate", "move this set's devices onto the pinned iOS runtime with `simctl upgrade`", global_options)
+    p.add_argument("--runtime", help="change the pin first, e.g. 27.0")
+    p.add_argument("--yes", action="store_true")
+    p.set_defaults(func=cmd_migrate)
 
-    p = add_subcommand(sub, "doctor", "check Xcode, runtimes, baguette, registry, and leases", global_options)
+    p = add_subcommand(sub, "doctor", "check runtimes, recommended tools, runtime pin, registry, and leases", global_options)
     p.set_defaults(func=cmd_doctor)
     return parser
 

@@ -9,7 +9,7 @@ MANIFEST_FILENAME = ".simset.json"
 
 DEFAULT_ROSTER = [
     {"type": "iPhone 17 Pro", "alias": "phone"},
-    {"type": "iPhone 16e", "alias": "phone-small"},
+    {"type": "iPhone 17e", "alias": "phone-small"},
     {"type": "iPad Pro 13-inch (M5)", "alias": "tablet"},
 ]
 

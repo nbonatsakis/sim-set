@@ -10,7 +10,7 @@ import tempfile
 import unittest
 from unittest import mock
 
-from fake_simctl import FakeSimctl, IPHONE_16E, make_device
+from fake_simctl import FakeSimctl, IOS_18_4, IOS_26_3, IPHONE_17E, IPHONE_17_PRO_MAX, make_device
 from simsetlib import cli
 
 
@@ -48,7 +48,7 @@ class ConfigureTests(CliCase):
         result = self.run_json("configure")
         self.assertEqual(result["id"], "triton")
         self.assertEqual([c["name"] for c in result["created"]],
-                         ["[triton] iPhone 17 Pro", "[triton] iPhone 16e", "[triton] iPad Pro 13-inch (M5)"])
+                         ["[triton] iPhone 17 Pro", "[triton] iPhone 17e", "[triton] iPad Pro 13-inch (M5)"])
         self.assertEqual(result["runtime"], "26.3")
         manifest = json.loads((self.project / ".simset.json").read_text())
         self.assertEqual(manifest["id"], "triton")
@@ -97,7 +97,7 @@ class ListTests(CliCase):
 
     def test_list_all_groups_by_set_and_unmanaged(self):
         self.fake.devices.append(make_device("iPhone 17 Pro"))
-        self.fake.devices.append(make_device("[other] iPhone 16e", devicetype_id=IPHONE_16E))
+        self.fake.devices.append(make_device("[other] iPhone 17e", devicetype_id=IPHONE_17E))
         self.run_json("configure")
         result = self.run_json("list", "--all")
         self.assertEqual(sorted(result["sets"].keys()), ["other", "triton"])
@@ -305,11 +305,11 @@ class LifecycleTests(CliCase):
     def test_remove_needs_yes_then_deletes_and_drops_roster(self):
         out = self.run_cli("remove", "phone-small", expect=1)
         self.assertIn("--yes", out)
-        self.assertIn("[triton] iPhone 16e", self.fake.names())
+        self.assertIn("[triton] iPhone 17e", self.fake.names())
         self.run_json("boot", "phone-small")
         result = self.run_json("remove", "phone-small", "--yes")
-        self.assertEqual(result["deleted"][0]["name"], "[triton] iPhone 16e")
-        self.assertNotIn("[triton] iPhone 16e", self.fake.names())
+        self.assertEqual(result["deleted"][0]["name"], "[triton] iPhone 17e")
+        self.assertNotIn("[triton] iPhone 17e", self.fake.names())
         manifest = json.loads((self.project / ".simset.json").read_text())
         self.assertEqual([e["type"] for e in manifest["roster"]], ["iPhone 17 Pro", "iPad Pro 13-inch (M5)"])
 
@@ -340,7 +340,7 @@ class PruneTests(CliCase):
             make_device("iPhone 17 Pro", udid="KEEP-TYPE"),
             make_device("iPhone 17 Pro Max", udid="GONE", devicetype_id="com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro-Max"),
             make_device("Booted Thing", udid="BOOTED", state="Booted", devicetype_id="com.apple.CoreSimulator.SimDeviceType.iPhone-17-Pro-Max"),
-            make_device("[other] iPhone 16e", udid="MANAGED", devicetype_id=IPHONE_16E),
+            make_device("[other] iPhone 17e", udid="MANAGED", devicetype_id=IPHONE_17E),
         ]
         self.run_json("configure")
 
@@ -356,7 +356,7 @@ class PruneTests(CliCase):
         self.assertEqual([d["udid"] for d in result["deleted"]], ["GONE"])
         self.assertIn(("delete", "GONE"), self.fake.calls)
         names = self.fake.names()
-        self.assertIn("[other] iPhone 16e", names)
+        self.assertIn("[other] iPhone 17e", names)
         self.assertIn("[triton] iPhone 17 Pro", names)
         self.assertIn("iPhone 17 Pro", names)
         self.assertIn("Booted Thing", names)
@@ -383,89 +383,104 @@ class PruneTests(CliCase):
         self.assertEqual(sorted(d["udid"] for d in result["deleted"]), ["GONE", "KEEP-TYPE"])
         self.assertIn(("delete", "KEEP-TYPE"), self.fake.calls)
         names = self.fake.names()
-        self.assertIn("[other] iPhone 16e", names)
+        self.assertIn("[other] iPhone 17e", names)
         self.assertIn("Booted Thing", names)
-
-
-from simsetlib import baguette
-
-
-class BaguetteTests(unittest.TestCase):
-    def test_farm_url_encodes_set_prefix(self):
-        self.assertEqual(baguette.farm_url(8421, "triton"), "http://127.0.0.1:8421/farm?q=%5Btriton%5D")
-        self.assertEqual(baguette.farm_url(9000), "http://127.0.0.1:9000/farm")
-
-    def test_ensure_running_states(self):
-        home = Path(tempfile.mkdtemp())
-        self.assertEqual(baguette.ensure_running(8421, home, which=lambda _: None, running=lambda p: False), "missing")
-        self.assertEqual(baguette.ensure_running(8421, home, which=lambda _: "/x/baguette", running=lambda p: True), "running")
-        spawned = []
-        checks = iter([False, False, True])
-
-        class Proc:
-            pid = 777
-
-        result = baguette.ensure_running(8421, home, which=lambda _: "/x/baguette",
-                                         popen=lambda cmd, **kw: spawned.append(cmd) or Proc(),
-                                         running=lambda p: next(checks), sleep=lambda s: None)
-        self.assertEqual(result, "started")
-        self.assertEqual(spawned, [["/x/baguette", "serve", "--port", "8421"]])
-        self.assertEqual((home / "baguette.pid").read_text().strip(), "777")
-
-
-class UiTests(CliCase):
-    def setUp(self):
-        super().setUp()
-        self.run_json("configure")
-
-    def test_ui_boots_set_and_opens_filtered_farm(self):
-        opened = []
-        with mock.patch.object(cli.baguette, "ensure_running", lambda port, home: "running"), \
-             mock.patch.object(cli.baguette, "open_url", lambda url: opened.append(url)):
-            result = self.run_json("ui")
-        self.assertEqual(result["url"], "http://127.0.0.1:8421/farm?q=%5Btriton%5D")
-        self.assertEqual(opened, [result["url"]])
-        self.assertTrue(all(d["state"] == "Booted" for d in self.run_json("list")["devices"]))
-
-    def test_ui_all_opens_unfiltered_and_missing_baguette_fails_after_boot(self):
-        with mock.patch.object(cli.baguette, "ensure_running", lambda port, home: "missing"), \
-             mock.patch.object(cli.baguette, "open_url", lambda url: None):
-            out = self.run_cli("ui", "--all", expect=1)
-        self.assertIn("brew", out)
-        self.assertTrue(all(d["state"] == "Booted" for d in self.run_json("list")["devices"]))
 
 
 class DoctorTests(CliCase):
     def test_doctor_reports_checks(self):
         self.run_json("configure")
         self.fake.devices.append(make_device("[orphan] iPhone 17 Pro"))
-        with mock.patch.object(cli.baguette, "is_running", lambda port: False), \
-             mock.patch.object(cli.shutil, "which", lambda _: None):
+        with mock.patch.object(cli.shutil, "which", lambda _: None):
             result = self.run_json("doctor", expect=1)
         names = {c["name"]: c for c in result["checks"]}
         self.assertTrue(names["simctl"]["ok"])
         self.assertTrue(names["ios-runtime"]["ok"])
-        self.assertFalse(names["baguette"]["ok"])
+        self.assertFalse(names["axe"]["ok"])
+        self.assertFalse(names["mobilebuildmcp"]["ok"])
+        self.assertTrue(names["runtime-pin"]["ok"])
         self.assertFalse(names["orphan-sets"]["ok"])
         self.assertIn("orphan", names["orphan-sets"]["detail"])
         self.assertTrue(names["leases"]["ok"])
 
-    def test_doctor_probes_query_filter_support_once(self):
+    def test_doctor_flags_devices_off_the_pinned_runtime(self):
         self.run_json("configure")
-        calls = []
-
-        def counting_supports_query_filter(port):
-            calls.append(port)
-            return True
-
-        with mock.patch.object(cli.shutil, "which", lambda _: "/x/baguette"), \
-             mock.patch.object(cli.baguette, "is_running", lambda port: True), \
-             mock.patch.object(cli.baguette, "supports_query_filter", counting_supports_query_filter):
-            result = self.run_json("doctor")
+        self.fake.devices.append(make_device("[triton] iPhone 17 Pro Max", devicetype_id=IPHONE_17_PRO_MAX, runtime=IOS_18_4))
+        with mock.patch.object(cli.shutil, "which", lambda name: f"/x/{name}"):
+            result = self.run_json("doctor", expect=1)
         names = {c["name"]: c for c in result["checks"]}
-        self.assertTrue(names["baguette"]["ok"])
-        self.assertIn("supported", names["baguette"]["detail"])
-        self.assertEqual(len(calls), 1)
+        self.assertFalse(names["runtime-pin"]["ok"])
+        self.assertIn("migrate", names["runtime-pin"]["detail"])
+
+
+class RuntimePinTests(CliCase):
+    def test_configure_pins_newest_runtime_and_keeps_pin(self):
+        result = self.run_json("configure")
+        self.assertEqual(result["pinned"], "26.3")
+        manifest = json.loads((self.project / ".simset.json").read_text())
+        self.assertEqual(manifest["runtime"], "26.3")
+        self.assertEqual(self.run_json("configure")["pinned"], "26.3")
+
+    def test_configure_reports_devices_on_other_runtimes(self):
+        self.fake.devices.append(make_device("[triton] iPhone 17 Pro", runtime=IOS_18_4))
+        result = self.run_json("configure")
+        self.assertEqual(result["off_runtime"], ["[triton] iPhone 17 Pro"])
+
+    def test_claim_skips_devices_off_the_pin_and_points_at_migrate(self):
+        self.fake.devices.append(make_device("[triton] iPhone 17 Pro", runtime=IOS_18_4))
+        self.run_json("configure")
+        out = self.run_cli("claim", "phone", expect=1)
+        self.assertIn("simset migrate", out)
+
+    def test_migrate_dry_run_then_upgrades_unleased_devices(self):
+        old = make_device("[triton] iPhone 17 Pro", udid="OLD", runtime=IOS_18_4, state="Booted")
+        self.fake.devices.append(old)
+        self.run_json("configure")
+        dry = self.run_json("migrate", expect=1)
+        self.assertTrue(dry["dry_run"])
+        self.assertEqual([d["udid"] for d in dry["upgrade"]], ["OLD"])
+        result = self.run_json("migrate", "--yes")
+        self.assertEqual([d["udid"] for d in result["upgraded"]], ["OLD"])
+        self.assertIn(("shutdown", "OLD"), self.fake.calls)
+        self.assertIn(("upgrade", "OLD", IOS_26_3), self.fake.calls)
+        self.assertEqual(self.run_json("claim", "phone")["udid"], "OLD")
+
+    def test_claim_payload_includes_destination(self):
+        self.run_json("configure")
+        result = self.run_json("claim", "phone")
+        self.assertEqual(result["destination"], f"platform=iOS Simulator,id={result['udid']}")
+
+
+class ShutdownTests(CliCase):
+    def setUp(self):
+        super().setUp()
+        self.run_json("configure")
+
+    def test_release_shuts_device_down_unless_keep_booted(self):
+        udid = self.run_json("claim", "phone", "--boot")["udid"]
+        result = self.run_json("release", udid)
+        self.assertEqual(result["shutdown"], [udid])
+        udid = self.run_json("claim", "phone", "--boot")["udid"]
+        result = self.run_json("release", udid, "--keep-booted")
+        self.assertEqual(result["shutdown"], [])
+
+    def test_reap_shutdown_idle_only_touches_unleased_managed_devices(self):
+        held = self.run_json("claim", "phone", "--boot")["udid"]
+        idle = self.run_json("claim", "tablet", "--boot")["udid"]
+        self.run_json("release", idle, "--keep-booted")
+        self.fake.devices.append(make_device("Unmanaged", udid="UNMANAGED", state="Booted"))
+        result = self.run_json("leases", "--reap", "--shutdown-idle")
+        self.assertEqual(result["shutdown"], [idle])
+        states = {d["udid"]: d["state"] for d in self.fake.devices}
+        self.assertEqual(states[held], "Booted")
+        self.assertEqual(states["UNMANAGED"], "Booted")
+
+
+class InstructionsFileTests(CliCase):
+    def test_configure_can_target_claude_local_md(self):
+        self.run_json("configure", "--claude-md", "CLAUDE.local.md")
+        self.assertIn("simset:start", (self.project / "CLAUDE.local.md").read_text())
+        self.assertFalse((self.project / "CLAUDE.md").exists())
 
 
 if __name__ == "__main__":

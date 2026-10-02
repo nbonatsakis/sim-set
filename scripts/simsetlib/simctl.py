@@ -56,5 +56,8 @@ class Simctl:
     def shutdown(self, udid):
         self._call("shutdown", udid)
 
+    def upgrade(self, udid, runtime_id):
+        self._call("upgrade", udid, runtime_id)
+
     def erase(self, udid):
         self._call("erase", udid)

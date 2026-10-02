@@ -46,12 +46,12 @@ class ManifestTests(unittest.TestCase):
     def test_alias_resolution_explicit_then_heuristic(self):
         explicit = Manifest.default("x")
         self.assertEqual(explicit.type_for_alias("phone"), "iPhone 17 Pro")
-        self.assertEqual(explicit.type_for_alias("phone-small"), "iPhone 16e")
+        self.assertEqual(explicit.type_for_alias("phone-small"), "iPhone 17e")
         self.assertEqual(explicit.type_for_alias("tablet"), "iPad Pro 13-inch (M5)")
         self.assertIsNone(explicit.type_for_alias("watch"))
-        bare = Manifest("y", [RosterEntry("iPhone 17 Pro Max"), RosterEntry("iPhone 16e"), RosterEntry("iPad mini (A17 Pro)")])
+        bare = Manifest("y", [RosterEntry("iPhone 17 Pro Max"), RosterEntry("iPhone 17e"), RosterEntry("iPad mini (A17 Pro)")])
         self.assertEqual(bare.type_for_alias("phone"), "iPhone 17 Pro Max")
-        self.assertEqual(bare.type_for_alias("phone-small"), "iPhone 16e")
+        self.assertEqual(bare.type_for_alias("phone-small"), "iPhone 17e")
         self.assertEqual(bare.type_for_alias("tablet"), "iPad mini (A17 Pro)")
 
 

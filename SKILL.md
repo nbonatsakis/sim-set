@@ -1,13 +1,13 @@
 ---
 name: sim-set
-description: Manage project-scoped iOS simulator sets so several coding agents can work on several apps at once without trampling each other's simulators. Use whenever a task involves picking, booting, creating, deleting, or listing iOS simulators; configuring a project for simulators; pruning the global simulator list; or opening a live view of a project's simulators. Triggers on "simulator", "simulators", "simctl", "sim set", "simset", "which simulator", "boot a simulator", "clean up simulators", "prune simulators", "configure simulators for this project", "simulator UI", "baguette".
+description: Manage project-scoped iOS simulator sets so several coding agents can work on several apps at once without trampling each other's simulators. Use whenever a task involves picking, booting, creating, deleting, or listing iOS simulators; configuring a project for simulators; pruning the global simulator list; or moving a project to a new iOS runtime. Triggers on "simulator", "simulators", "simctl", "sim set", "simset", "which simulator", "boot a simulator", "clean up simulators", "prune simulators", "configure simulators for this project", "migrate simulators", "iOS 27 simulator".
 ---
 
 # sim-set
 
-`simset` namespaces ordinary CoreSimulator devices by name (`[<set-id>] <Device Type>`), so every existing tool (xcodebuild, Xcode, AXe, XcodeBuildMCP, idb, the Claude Code Desktop simulator pane) keeps working while each project owns its own devices and agents lease them exclusively.
+`simset` namespaces ordinary CoreSimulator devices by name (`[<set-id>] <Device Type>`), so every existing tool (xcodebuild, Xcode and Device Hub, AXe, MobileBuildMCP, idb) keeps working while each project owns its own devices and agents lease them exclusively.
 
-Devices live in the default device set on purpose: `xcodebuild` cannot target devices in a custom `simctl --set` set, and AXe and XcodeBuildMCP cannot see them either.
+Devices live in the default device set on purpose: `xcodebuild` cannot target devices in a custom `simctl --set` set, and AXe and MobileBuildMCP cannot see them either.
 
 ## Install
 
@@ -27,17 +27,29 @@ simset configure                       # id = directory name, default roster
 simset configure --id ck --roster "iPhone 17 Pro" --roster "iPad mini (A17 Pro)"
 ```
 
-`configure` writes `.simset.json` (commit it), creates any missing roster devices on the newest iOS runtime, registers the set in `~/.simset/registry.json`, and injects a marker-delimited section into the project's `CLAUDE.md` telling agents to claim devices through `simset`. Re-running is safe and never deletes anything.
+`configure` writes `.simset.json` (commit it), pins the set to the newest installed iOS runtime (major.minor, e.g. `27.0`; `--runtime 26.3` to choose), creates any missing roster devices on it, registers the set in `~/.simset/registry.json`, and injects a marker-delimited section into the project's `CLAUDE.md` telling agents how to claim and drive devices (sim-set rules, Xcode 27 facts, MobileBuildMCP/AXe usage). For a repo you don't own, `--claude-md CLAUDE.local.md` keeps the instructions out of the shared file. Re-running is safe and never deletes anything; it keeps the existing pin.
 
-Default roster: `iPhone 17 Pro` (`phone`), `iPhone 16e` (`phone-small`), `iPad Pro 13-inch (M5)` (`tablet`).
+Default roster: `iPhone 17 Pro` (`phone`), `iPhone 17e` (`phone-small`), `iPad Pro 13-inch (M5)` (`tablet`).
+
+### Moving to a new Xcode runtime
+
+`claim` only hands out devices on the pinned runtime. After installing a new iOS runtime:
+
+```bash
+simset migrate --runtime 27.0          # dry run: what would move
+simset migrate --runtime 27.0 --yes    # repin, then `xcrun simctl upgrade` each unleased device in place
+```
+
+`migrate` keeps names and udids (no duplicates), skips leased devices, and can't downgrade.
 
 ## Agent workflow (what the injected CLAUDE.md section says)
 
 ```bash
-UDID=$(simset claim phone --label "fix onboarding" --boot --json | jq -r .udid)
-xcodebuild -scheme App -destination "platform=iOS Simulator,id=$UDID" build
-axe describe-ui --udid "$UDID"
-simset release --mine
+CLAIM=$(simset claim phone --label "fix onboarding" --boot --json)
+UDID=$(jq -r .udid <<<"$CLAIM"); DEST=$(jq -r .destination <<<"$CLAIM")
+xcodebuild -scheme App -destination "$DEST" build
+mobilebuildmcp ui-automation snapshot-ui --simulator-id "$UDID"
+simset release --mine                  # also shuts the device down
 ```
 
 `claim --boot` does not return until the device has finished booting (via `xcrun simctl bootstatus -b`), so it's safe to screenshot or drive the UI immediately after. If every device of a size is leased: `simset claim phone --wait 300` waits up to 5 minutes for one to free up; `--grow` provisions `[id] iPhone 17 Pro #2` instead. Passing both waits first and only grows if the wait times out. Leases expire after 4 hours (`--ttl`) or when the owning `claude` process exits; run `simset claim --renew <udid>` before that if you're still working. If `claim` warns about `SIMSET_OWNER_PID`, it means no `claude` ancestor process was found — set that environment variable to a long-lived pid.
@@ -49,28 +61,16 @@ simset list --all                                   # every simulator grouped by
 simset prune --keep "iPhone 17 Pro" --keep "iPad Pro 13-inch (M5)"   # dry run
 simset prune --keep "iPhone 17 Pro" --yes           # delete the rest of the unmanaged devices
 simset prune --keep-nothing --yes                   # delete every unmanaged simulator
-simset leases --reap                                # drop stale leases
-simset doctor                                       # Xcode, runtimes, baguette, registry, leases
+simset leases --reap                                # drop stale leases, shut their devices down
+simset leases --reap --shutdown-idle                # also shut down every booted [set] device nobody leases
+simset doctor                                       # runtimes, axe + mobilebuildmcp, runtime pin, registry, leases
 ```
 
 `prune` never touches a device whose name matches `[set] ...`, registered or not. It also refuses to run at all unless you pass at least one `--keep`, or `--keep-nothing` to explicitly opt into deleting every unmanaged simulator.
 
-## Live view
+## Watching devices
 
-```bash
-simset ui          # boots this project's devices, opens the baguette farm filtered to [id]
-simset ui --all    # unfiltered farm
-```
-
-Requires baguette with the `?q=` farm filter. Until upstream merges it, build the fork:
-
-```bash
-git clone https://github.com/nbonatsakis/baguette ~/dev/forks/baguette
-cd ~/dev/forks/baguette && git checkout farm-name-filter && swift build -c release
-ln -sf ~/dev/forks/baguette/.build/release/baguette ~/.local/bin/baguette
-```
-
-After the merge, `brew install baguette` is enough. `simset doctor` reports whether the running baguette supports the filter.
+Xcode 27 has no Simulator.app; `open -a DeviceHub` shows every simulator in one window. Agents never need a window: simctl, AXe, and MobileBuildMCP drive devices headless. (The old `simset ui` baguette farm view was removed in favor of Device Hub.)
 
 ## Reference
 
